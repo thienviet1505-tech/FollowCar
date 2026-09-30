@@ -1,0 +1,16 @@
+{
+  "name": "esp-nn",
+  "version": "1.4.1",
+  "description": "Optimized NN kernels for ESP32-S3 (vendored from espressif/esp-nn)",
+  "build": {
+    "flags": [
+      "-Iinclude",
+      "-Isrc/common",
+      "-O2",
+      "-fno-unroll-loops",
+      "-Wno-unused-function"
+    ],
+    "srcDir": "src",
+    "includeDir": "include"
+  }
+}
