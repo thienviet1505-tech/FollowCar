@@ -17,6 +17,10 @@ public:
     static void decode(const ModelInference& model, int origWidth, int origHeight,
                         std::vector<Detection>& outDetections);
 
+    // Điểm cao nhất của từng class trong frame vừa decode (tính trước khi lọc
+    // ngưỡng) — để biết model "đang nghĩ gì" kể cả khi chưa vượt CONF_THRESHOLD.
+    static const std::vector<float>& classMaxScores();
+
 private:
     static float dequant(int8_t raw, float scale, int zeroPoint) {
         return (raw - zeroPoint) * scale;

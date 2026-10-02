@@ -35,31 +35,10 @@ SensorTuning makeOV3660() {
 // cao, bù sáng +1, trần gain 8x. Tinh chỉnh thêm bằng chế độ xem ảnh.
 SensorTuning makeOV2640() {
     SensorTuning t;
-    t.awb = 1;
-    t.awb_gain = 1;
-    t.wb_mode = 0;
-    t.aec = 1;
     t.aec2 = 1;
     t.ae_level = 1;
-    t.aec_value = 168;
-    t.agc = 1;
-    t.agc_gain = 0;
-    t.gainceiling = 2;
     t.brightness = 1;
-    t.contrast = 0;
-    t.saturation = 0;
-    t.sharpness = 0;
-    t.bpc = 0;
-    t.wpc = 1;
-    t.raw_gma = 1;
-    t.lenc = 1;
-    t.hmirror = 0;
-    t.vflip = 0;
-    t.dcw = 1;
-    // t.aec2 = 1;
-    // t.ae_level = 1;
-    // t.brightness = 1;
-    // t.gainceiling = GAINCEILING_8X;
+    t.gainceiling = GAINCEILING_8X;
     return t;
 }
 
@@ -161,7 +140,7 @@ bool CameraModule::begin() {
     config_.frame_size   = FRAMESIZE_QVGA;    // 320x240, đổi nếu cần ảnh to/nhỏ hơn
     config_.fb_count     = 2;
     config_.fb_location  = CAMERA_FB_IN_PSRAM;
-    config_.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
+    config_.grab_mode    = CAMERA_GRAB_LATEST;  // luôn lấy frame mới nhất (WHEN_EMPTY có thể trả frame cũ khi Invoke chậm)
 
     esp_err_t err = esp_camera_init(&config_);
     if (err != ESP_OK) {

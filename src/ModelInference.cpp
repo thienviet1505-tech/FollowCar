@@ -159,7 +159,7 @@ bool ModelInference::begin(size_t tensor_arena_size) {
     input_tensor = interpreter->input(0);
     output_tensor = interpreter->output(0);
 
-    // Model input shape: [1, 3, 224, 224] = NCHW
+    // Model input shape: [1, C, H, W] = NCHW
     input_channels_ = input_tensor->dims->data[1];
     input_height_   = input_tensor->dims->data[2];
     input_width_    = input_tensor->dims->data[3];
@@ -168,9 +168,14 @@ bool ModelInference::begin(size_t tensor_arena_size) {
     input_scale_      = input_tensor->params.scale;
     input_zero_point_ = input_tensor->params.zero_point;
 
-    Serial.printf("[ModelInference] Input %dx%dx%d (%d bytes), output %d bytes\n",
-                  input_width_, input_channels_, input_height_,
-                  (int)input_bytes_, (int)output_tensor->bytes);
+    Serial.printf("[Model] input=%dx%dx%d bytes=%d | output type=%d bytes=%d dims=",
+                  input_width_, input_height_, input_channels_,
+                  (int)input_bytes_, output_tensor->type, (int)output_tensor->bytes);
+    for (int i = 0; i < output_tensor->dims->size; i++) {
+        Serial.printf("%d", output_tensor->dims->data[i]);
+        if (i + 1 < output_tensor->dims->size) Serial.print("x");
+    }
+    Serial.println();
 
     return true;
 }
@@ -184,18 +189,9 @@ bool ModelInference::invoke(const float* input_data, size_t input_len) {
         return false;
     }
 
-    Serial.println("[ModelInference] bat dau memcpy");
     memcpy(input_tensor->data.f, input_data, input_len);
-    Serial.println("[ModelInference] memcpy xong");
 
-    Serial.println("[ModelInference] bat dau Invoke");
-    uint32_t t0 = millis();
     TfLiteStatus status = interpreter->Invoke();
-    uint32_t t1 = millis();
-
-Serial.printf("[ModelInference] Invoke xong: %lu ms, status=%d\n",
-              (unsigned long)(t1 - t0), status);
-
     return status == kTfLiteOk;
 }
 
