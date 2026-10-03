@@ -1,10 +1,13 @@
 #include "ModelInference.h"
 #include <Arduino.h>
-#include <cstring>
+#include <cmath>
+#include <algorithm>
 #include <esp_heap_caps.h>
+#include "LogisticLut.h" 
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/micro_profiler.h"
 #include "tensorflow/lite/schema/schema_generated.h"
 
 #include "model_data.h"
@@ -15,6 +18,10 @@ tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input_tensor = nullptr;
 TfLiteTensor* output_tensor = nullptr;
 uint8_t* tensor_arena = nullptr;
+
+// Profiler phải sống ít nhất lâu bằng interpreter.
+static tflite::MicroProfiler profiler;
+static bool profile_printed = false;
 
 constexpr int kNumOps = 103;
 
@@ -75,7 +82,7 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddLogicalAnd();
         resolver.AddLogicalNot();
         resolver.AddLogicalOr();
-        resolver.AddLogistic();
+        resolver.AddLogistic(RegisterLogisticLut());
         resolver.AddMaxPool2D();
         resolver.AddMaximum();
         resolver.AddMean();
@@ -126,7 +133,6 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddVarHandle();
         resolver.AddWhile();
         resolver.AddZerosLike();
-
         initialized = true;
     }
 
@@ -141,14 +147,22 @@ bool ModelInference::begin(size_t tensor_arena_size) {
         return false;
     }
 
-    tensor_arena = (uint8_t*)heap_caps_malloc(tensor_arena_size, MALLOC_CAP_SPIRAM);
+    tensor_arena = static_cast<uint8_t*>(
+        heap_caps_malloc(tensor_arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    );
+
     if (!tensor_arena) {
-        Serial.println("[ModelInference] Khong cap phat duoc tensor arena tu PSRAM");
+        Serial.printf("[Model] ERROR: PSRAM arena allocation failed (%u bytes)\n",
+                      (unsigned)tensor_arena_size);
         return false;
     }
 
+    Serial.printf("[Model] PSRAM arena=%u bytes, free PSRAM=%u bytes\n",
+                  (unsigned)tensor_arena_size,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+
     static tflite::MicroInterpreter static_interpreter(
-        tfl_model, GetResolver(), tensor_arena, tensor_arena_size);
+        tfl_model, GetResolver(), tensor_arena, tensor_arena_size, nullptr, &profiler);
     interpreter = &static_interpreter;
 
     if (interpreter->AllocateTensors() != kTfLiteOk) {
@@ -159,62 +173,100 @@ bool ModelInference::begin(size_t tensor_arena_size) {
     input_tensor = interpreter->input(0);
     output_tensor = interpreter->output(0);
 
-    // Model input shape: [1, C, H, W] = NCHW
-    input_channels_ = input_tensor->dims->data[1];
-    input_height_   = input_tensor->dims->data[2];
-    input_width_    = input_tensor->dims->data[3];
+    // Chi ho tro model IO int8.
+    if (input_tensor->type != kTfLiteInt8 || output_tensor->type != kTfLiteInt8) {
+        Serial.printf("[ModelInference] Can model IO int8 (input type=%d, output type=%d, int8=%d)\n",
+                      (int)input_tensor->type, (int)output_tensor->type, (int)kTfLiteInt8);
+        return false;
+    }
 
-    input_bytes_      = input_tensor->bytes;
-    input_scale_      = input_tensor->params.scale;
+    // Model input shape: [1, C, H, W] = NCHW.
+    input_channels_ = input_tensor->dims->data[1];
+    input_height_ = input_tensor->dims->data[2];
+    input_width_ = input_tensor->dims->data[3];
+
+    input_bytes_ = input_tensor->bytes;
+    input_scale_ = input_tensor->params.scale;
     input_zero_point_ = input_tensor->params.zero_point;
 
-    Serial.printf("[Model] input=%dx%dx%d bytes=%d | output type=%d bytes=%d dims=",
+    output_scale_ = output_tensor->params.scale;
+    output_zero_point_ = output_tensor->params.zero_point;
+    output_f_.assign(output_tensor->bytes, 0.0f);
+
+    // LUT: pixel 0..255 -> int8 quantized value.
+    for (int v = 0; v < 256; v++) {
+        int q = (int)std::lround((v / 255.0f) / input_scale_) + input_zero_point_;
+        pixel_lut_[v] = (int8_t)std::max(-128, std::min(127, q));
+    }
+
+    Serial.printf("[Model] input=%dx%dx%d bytes=%d scale=%.6f zp=%d | output type=%d bytes=%d scale=%.6f zp=%d dims=",
                   input_width_, input_height_, input_channels_,
-                  (int)input_bytes_, output_tensor->type, (int)output_tensor->bytes);
+                  (int)input_bytes_, input_scale_, input_zero_point_,
+                  output_tensor->type, (int)output_tensor->bytes,
+                  output_scale_, output_zero_point_);
     for (int i = 0; i < output_tensor->dims->size; i++) {
         Serial.printf("%d", output_tensor->dims->data[i]);
         if (i + 1 < output_tensor->dims->size) Serial.print("x");
     }
     Serial.println();
 
+    Serial.printf("[Model] arena used=%u / %u bytes\n",
+                  (unsigned)interpreter->arena_used_bytes(), (unsigned)tensor_arena_size);
+
     return true;
 }
 
-bool ModelInference::invoke(const float* input_data, size_t input_len) {
-    if (!interpreter || !input_tensor) return false;
-
-    if (input_len != input_bytes_) {
-        Serial.printf("[ModelInference] Input size sai: %d != %d\n",
-                      input_len, input_bytes_);
-        return false;
-    }
-
-    memcpy(input_tensor->data.f, input_data, input_len);
-
-    TfLiteStatus status = interpreter->Invoke();
-    return status == kTfLiteOk;
+int8_t* ModelInference::inputData() {
+    return input_tensor ? input_tensor->data.int8 : nullptr;
 }
 
-const float* ModelInference::outputData() const {
-    return output_tensor->data.f;
+bool ModelInference::invoke() {
+    if (!interpreter || !input_tensor || !output_tensor) return false;
+
+    Serial.println("[NN] INT8 invoke start");
+    if (interpreter->Invoke() != kTfLiteOk) {
+        Serial.println("[NN] INT8 invoke FAIL");
+        return false;
+    }
+    Serial.println("[NN] INT8 invoke end");
+
+    // In profiler sau lan invoke dau tien. Self-test cua main.cpp chay truoc loop,
+    // nen log profiler se xuat 1 lan va khong can sua main.cpp.
+    if (!profile_printed) {
+        profile_printed = true;
+        Serial.println();
+        Serial.println("================ TFLITE MICRO PROFILE ================");
+        profiler.Log();
+        Serial.println("=======================================================");
+        Serial.println();
+    }
+
+    // Giai luong tuong output: x = (q - zero_point) * scale.
+    const int8_t* q = output_tensor->data.int8;
+    const size_t n = output_f_.size();
+    float* out = output_f_.data();
+    for (size_t i = 0; i < n; i++) {
+        out[i] = (float)((int)q[i] - output_zero_point_) * output_scale_;
+    }
+    return true;
+}
+
+void ModelInference::printProfile() {
+    Serial.println();
+    Serial.println("================ TFLITE MICRO PROFILE ================");
+    profiler.Log();
+    Serial.println("=======================================================");
 }
 
 int ModelInference::outputElements() const {
-    return output_tensor->bytes;
+    return output_tensor ? output_tensor->bytes : 0;
 }
 
 int ModelInference::outputNumDims() const {
-    return output_tensor->dims->size;
+    return output_tensor ? output_tensor->dims->size : 0;
 }
 
 int ModelInference::outputDim(int index) const {
+    if (!output_tensor || index < 0 || index >= output_tensor->dims->size) return 0;
     return output_tensor->dims->data[index];
-}
-
-float ModelInference::outputScale() const {
-    return output_tensor->params.scale;
-}
-
-int ModelInference::outputZeroPoint() const {
-    return output_tensor->params.zero_point;
 }

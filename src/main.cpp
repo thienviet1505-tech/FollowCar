@@ -15,7 +15,6 @@ bool g_triggerSelfTest = false;
 namespace {
 CameraModule camera;
 ModelInference model;
-std::vector<float> inputBuf;
 
 // Trung bình trượt 5 frame gần nhất cho tổng thời gian xử lý và tuổi frame.
 struct Avg5 {
@@ -29,8 +28,9 @@ uint32_t frameId = 0;
 
 
 // Resize nearest-neighbor từ framebuffer RGB565 xuống đúng kích thước input.
-// Model sử dụng layout NCHW: [1, 3, H, W].
-bool preprocessFrame(camera_fb_t* fb, float* outBuf, size_t outBufSize,
+// Model sử dụng layout NCHW: [1, 3, H, W]. outBuf là tensor input int8,
+// lut là bảng đổi pixel 0..255 -> int8 (ModelInference::pixelLut()).
+bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const int8_t* lut,
                      int modelW, int modelH, int modelC) {
     if (modelC != 3) {
         Serial.println("[Preprocess] Chi ho tro model 3 kenh (RGB) o khung nay.");
@@ -65,7 +65,7 @@ bool preprocessFrame(camera_fb_t* fb, float* outBuf, size_t outBufSize,
     size_t planeSize = (size_t)modelW * modelH;
 
     // Ultralytics dùng padding màu 114.
-    const float padValue = 114.0f / 255.0f;
+    const int8_t padValue = lut[114];
 
     // Ban đầu toàn bộ canvas là padding.
     std::fill(outBuf, outBuf + needed, padValue);
@@ -99,9 +99,9 @@ bool preprocessFrame(camera_fb_t* fb, float* outBuf, size_t outBufSize,
             size_t pixelIdx = (size_t)dstY * modelW + dstX;
 
             // NCHW: [R plane][G plane][B plane]
-            outBuf[0 * planeSize + pixelIdx] = r8 / 255.0f;
-            outBuf[1 * planeSize + pixelIdx] = g8 / 255.0f;
-            outBuf[2 * planeSize + pixelIdx] = b8 / 255.0f;
+            outBuf[0 * planeSize + pixelIdx] = lut[r8];
+            outBuf[1 * planeSize + pixelIdx] = lut[g8];
+            outBuf[2 * planeSize + pixelIdx] = lut[b8];
 
         }
     }
@@ -114,13 +114,20 @@ void runSelfTest(ModelInference& model) {
     Serial.println();
     Serial.println("================ SELF-TEST ================");
 
-    if (inputBuf.size() < TEST_SAMPLE_SIZE) inputBuf.resize(TEST_SAMPLE_SIZE);
+    if (TEST_SAMPLE_SIZE != model.inputBytes()) {
+        Serial.printf("[SelfTest] FAIL | anh mau %u byte != input model %u byte\n",
+                      (unsigned)TEST_SAMPLE_SIZE, (unsigned)model.inputBytes());
+        Serial.println("============================================");
+        return;
+    }
+    int8_t* in = model.inputData();
+    const int8_t* lut = model.pixelLut();
     for (size_t i = 0; i < TEST_SAMPLE_SIZE; i++) {
-        inputBuf[i] = pgm_read_byte(&TEST_SAMPLE_NCHW[i]) / 255.0f;
+        in[i] = lut[pgm_read_byte(&TEST_SAMPLE_NCHW[i])];
     }
 
     const uint32_t t0 = millis();
-    const bool ok = model.invoke(inputBuf.data(), inputBuf.size() * sizeof(float));
+    const bool ok = model.invoke();
     const uint32_t invokeMs = millis() - t0;
 
     if (!ok) {
@@ -157,7 +164,6 @@ void setup() {
         while (true) delay(1000);
     }
 
-    inputBuf.resize(model.inputBytes() / sizeof(float));
     runSelfTest(model);
     camera.discardFrames(3);
     Serial.println("[Boot] detect ready");
@@ -198,7 +204,7 @@ void loop() {
     const int origH = fb->height;
 
     const int64_t tPre0 = esp_timer_get_time();
-    const bool ok = preprocessFrame(fb, inputBuf.data(), inputBuf.size(),
+    const bool ok = preprocessFrame(fb, model.inputData(), model.inputBytes(), model.pixelLut(),
                                     model.inputWidth(), model.inputHeight(), model.inputChannels());
     const int64_t tPre1 = esp_timer_get_time();
     camera.release(fb);
@@ -211,7 +217,7 @@ void loop() {
     }
 
     const int64_t tInv0 = esp_timer_get_time();
-    if (!model.invoke(inputBuf.data(), inputBuf.size() * sizeof(float))) {
+    if (!model.invoke()) {
         Serial.println("[Inference] FAIL");
         Serial.println("------------------------------------------------------------");
         delay(50);
