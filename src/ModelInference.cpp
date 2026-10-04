@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <esp_heap_caps.h>
 #include "LogisticLut.h"
+#include "QuantizeLut.h"
+#include "ConvOpt.h"
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -20,6 +22,10 @@
 #ifndef NN_DUAL_CORE
 #define NN_DUAL_CORE 1
 #endif
+// Profiler chỉ bật khi cần:  -DPROFILE_OPS=1  (in bảng thời gian từng op sau mỗi lần invoke).
+#ifndef PROFILE_OPS
+#define PROFILE_OPS 1
+#endif
 
 // Đa lõi của ESP-NN (esp-nn/include/esp_nn_multicore.h).
 extern "C" {
@@ -34,9 +40,14 @@ TfLiteTensor* input_tensor = nullptr;
 TfLiteTensor* output_tensor = nullptr;
 uint8_t* tensor_arena = nullptr;
 
+#if PROFILE_OPS
 // Profiler phải sống ít nhất lâu bằng interpreter.
 static tflite::MicroProfiler profiler;
 static bool profile_printed = false;
+#define PROFILER_PTR (&profiler)
+#else
+#define PROFILER_PTR nullptr
+#endif
 
 constexpr int kNumOps = 103;
 
@@ -61,7 +72,7 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddCeil();
         resolver.AddCircularBuffer();
         resolver.AddConcatenation();
-        resolver.AddConv2D();
+        resolver.AddConv2D(RegisterConvOpt());
         resolver.AddCos();
         resolver.AddCumSum();
         resolver.AddDecode();
@@ -110,7 +121,7 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddPad();
         resolver.AddPadV2();
         resolver.AddPrelu();
-        resolver.AddQuantize();
+        resolver.AddQuantize(RegisterQuantizeLut());
         resolver.AddReadVariable();
         resolver.AddReduceAll();
         resolver.AddReduceMax();
@@ -195,13 +206,14 @@ bool ModelInference::begin(size_t tensor_arena_size) {
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     static tflite::MicroInterpreter static_interpreter(
-        tfl_model, GetResolver(), tensor_arena, tensor_arena_size, nullptr, &profiler);
+        tfl_model, GetResolver(), tensor_arena, tensor_arena_size, nullptr, PROFILER_PTR);
     interpreter = &static_interpreter;
 
     if (interpreter->AllocateTensors() != kTfLiteOk) {
         Serial.println("[ModelInference] AllocateTensors that bai");
         return false;
     }
+    Serial.printf("[Model] ConvOpt per-pixel nodes: %d\n", ConvOptFastNodeCount());
 
 #if NN_DUAL_CORE
     esp_nn_dual_core_enable();   // gọi từ core chạy suy luận (loopTask)
@@ -268,8 +280,9 @@ bool ModelInference::invoke() {
     }
     Serial.println("[NN] INT8 invoke end");
 
-    // In profiler sau lan invoke dau tien. Self-test cua main.cpp chay truoc loop,
-    // nen log profiler se xuat 1 lan va khong can sua main.cpp.
+#if PROFILE_OPS
+    // MicroProfiler chỉ chứa tối đa 4096 sự kiện (~283/lần invoke) -> in xong phải xoá,
+    // nếu không sẽ abort() sau ~14 frame. Chỉ in 1 lần đầu cho đỡ rối log.
     if (!profile_printed) {
         profile_printed = true;
         Serial.println();
@@ -278,6 +291,8 @@ bool ModelInference::invoke() {
         Serial.println("=======================================================");
         Serial.println();
     }
+    profiler.ClearEvents();
+#endif
 
     // Giai luong tuong output: x = (q - zero_point) * scale.
     const int8_t* q = output_tensor->data.int8;
@@ -290,10 +305,15 @@ bool ModelInference::invoke() {
 }
 
 void ModelInference::printProfile() {
+#if PROFILE_OPS
     Serial.println();
     Serial.println("================ TFLITE MICRO PROFILE ================");
     profiler.Log();
     Serial.println("=======================================================");
+    profiler.ClearEvents();
+#else
+    Serial.println("[Profile] Build voi -DPROFILE_OPS=1 de bat profiler.");
+#endif
 }
 
 int ModelInference::outputElements() const {
