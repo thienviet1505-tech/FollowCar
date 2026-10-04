@@ -8,6 +8,13 @@
 // từng kênh ra; hệ số requantize và hiệu chỉnh bias tính 1 lần ở Prepare).
 // Mọi conv khác được giao nguyên cho kernel CONV_2D gốc của TFLM/ESP-NN.
 //
+// Đường per-pixel gốc đọc lại toàn bộ filter cho MỖI điểm ảnh; filter lớn hơn cache dữ liệu
+// và nằm trong PSRAM nên kernel bị nghẽn bộ nhớ. Vì vậy kernel duyệt theo khối kênh ra: chép
+// filter của một khối sang vùng đệm SRAM nội (cấp 1 lần, tối đa CONV_OPT_STAGE_BYTES, mặc định
+// 24 KB ~ 10 kênh ra khi K = 2304) rồi chạy hết mọi điểm ảnh cho khối đó. Kết quả không đổi.
+// Không cấp được SRAM nội thì tự đọc filter từ PSRAM như cũ.
+// Tắt: -DCONV_OPT_STAGE_FILTER=0.  Đổi dung lượng: -DCONV_OPT_STAGE_BYTES=12288
+//
 // Dùng:  resolver.AddConv2D(RegisterConvOpt());
 TFLMRegistration RegisterConvOpt();
 
@@ -24,3 +31,6 @@ void ConvOptSetTargets(const ConvOptTarget* targets, int count);
 // Số node CONV_2D đang chạy bằng đường per-pixel (sau AllocateTensors) - để kiểm tra
 // danh sách target có khớp model hay không.
 int ConvOptFastNodeCount();
+
+// Kích thước vùng đệm SRAM nội đang dùng cho filter (0 = không cấp được hoặc đã tắt).
+int ConvOptStagingBytes();

@@ -31,7 +31,16 @@
 extern "C" {
 void esp_nn_dual_core_enable(void);
 bool esp_nn_dual_core_active(void);
+void* esp_nn_dual_core_scratch(int size);
 }
+
+// Cấp sẵn scratch dùng chung của ESP-NN dual-core ngay khi khởi động (byte).
+// Lớp conv 3x3 K=1152 cần 62.560 B; nếu để thư viện tự tăng dần, lúc cần thì RAM nội
+// đã phân mảnh (khối lớn nhất < 62,5 KB) -> rơi sang PSRAM -> các lớp K=1152 chậm.
+// Đặt 0 để tắt.
+#ifndef NN_SCRATCH_PREALLOC
+#define NN_SCRATCH_PREALLOC 65536
+#endif
 
 namespace {
 const tflite::Model* tfl_model = nullptr;
@@ -214,10 +223,26 @@ bool ModelInference::begin(size_t tensor_arena_size) {
         return false;
     }
     Serial.printf("[Model] ConvOpt per-pixel nodes: %d\n", ConvOptFastNodeCount());
+    Serial.printf("[Model] ConvOpt staging=%d bytes | internal free=%u largest=%u\n",
+                  ConvOptStagingBytes(),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
 
 #if NN_DUAL_CORE
     esp_nn_dual_core_enable();   // gọi từ core chạy suy luận (loopTask)
     Serial.printf("[Model] ESP-NN dual-core: %s\n", esp_nn_dual_core_active() ? "ON" : "OFF");
+#if NN_SCRATCH_PREALLOC > 0
+    if (esp_nn_dual_core_active()) {
+        void* scr = esp_nn_dual_core_scratch(NN_SCRATCH_PREALLOC);
+        Serial.printf("[Model] dual-core scratch=%d B @%p (%s) | internal free=%u largest=%u\n",
+                      NN_SCRATCH_PREALLOC, scr,
+                      scr == nullptr ? "null"
+                      : ((uintptr_t)scr >= 0x3C000000u && (uintptr_t)scr < 0x3E000000u) ? "PSRAM"
+                      : "internal",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    }
+#endif
 #endif
 
     input_tensor = interpreter->input(0);

@@ -11,6 +11,18 @@
 
 #include <common_functions.h>
 
+// Chép filter theo từng khối kênh ra vào SRAM nội trước khi tính (xem ConvOpt.h).
+// Tắt để so sánh: -DCONV_OPT_STAGE_FILTER=0.  Dung lượng vùng đệm: -DCONV_OPT_STAGE_BYTES=...
+#ifndef CONV_OPT_STAGE_FILTER
+#define CONV_OPT_STAGE_FILTER 1
+#endif
+#ifndef CONV_OPT_STAGE_BYTES
+#define CONV_OPT_STAGE_BYTES 24576
+#endif
+#if CONV_OPT_STAGE_FILTER
+#include <esp_heap_caps.h>
+#endif
+
 namespace {
 
 // Khai báo extern "C" đặt TRONG namespace ẩn danh: common_functions.h đã khai báo cùng tên
@@ -27,6 +39,24 @@ const ConvOptTarget kDefaultTargets[] = {{7, 7, 256, 64}};
 const ConvOptTarget* g_targets = kDefaultTargets;
 int g_target_count = sizeof(kDefaultTargets) / sizeof(kDefaultTargets[0]);
 int g_fast_nodes = 0;
+
+#if CONV_OPT_STAGE_FILTER
+// Vùng đệm SRAM nội dùng chung cho mọi node target (các node chạy tuần tự), chứa filter của
+// một khối kênh ra. Cấp một lần, giữ suốt chương trình. Không cấp được thì node đọc filter
+// trực tiếp từ PSRAM.
+int8_t* g_stage = nullptr;
+size_t g_stage_size = 0;
+
+void EnsureStaging(size_t bytes) {
+    if (bytes <= g_stage_size) return;
+    int8_t* p = static_cast<int8_t*>(
+        heap_caps_aligned_alloc(16, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (p == nullptr) return;  // giữ vùng cũ (nếu có); node cần nhiều hơn sẽ đọc từ PSRAM
+    if (g_stage != nullptr) heap_caps_free(g_stage);
+    g_stage = p;
+    g_stage_size = bytes;
+}
+#endif
 
 struct ConvOptData {
     TFLMRegistration base;   // kernel CONV_2D gốc, dùng cho mọi node không phải target
@@ -107,26 +137,51 @@ void BuildWindow(const ConvOptData* d, const int8_t* input, int8_t* window,
     }
 }
 
+// Duyệt theo khối kênh ra: với mỗi khối, chép filter của khối sang SRAM nội (nếu có vùng đệm)
+// rồi chạy hết mọi điểm ảnh, nên mỗi filter chỉ đọc 1 lần từ PSRAM thay vì 1 lần mỗi điểm ảnh.
+// Không có vùng đệm: 1 khối duy nhất, đọc filter thẳng từ PSRAM (cách cũ).
 void RunFast(const ConvOptData* d, const int8_t* input, const int8_t* filter,
              int8_t* output, void* scratch) {
     int8_t* window = reinterpret_cast<int8_t*>(
         (reinterpret_cast<uintptr_t>(scratch) + 15u) & ~uintptr_t(15u));
     const int8_t pad_val = static_cast<int8_t>(-d->input_offset);
 
-    for (int oy = 0; oy < d->in_h; ++oy) {
-        for (int ox = 0; ox < d->in_w; ++ox) {
-            BuildWindow(d, input, window, oy, ox, pad_val);
+    int chunk_oc = d->out_c;
+    int8_t* stage = nullptr;
+#if CONV_OPT_STAGE_FILTER
+    if (g_stage != nullptr) {
+        const int fit = static_cast<int>(g_stage_size / d->window_len);
+        if (fit >= 1) {
+            stage = g_stage;
+            chunk_oc = fit < d->out_c ? fit : d->out_c;
+        }
+    }
+#endif
 
-            int8_t* out = output + (oy * d->in_w + ox) * d->out_c;
+    for (int oc0 = 0; oc0 < d->out_c; oc0 += chunk_oc) {
+        const int n = (d->out_c - oc0) < chunk_oc ? (d->out_c - oc0) : chunk_oc;
+        const int8_t* w = filter + static_cast<size_t>(oc0) * d->window_len;
+        if (stage != nullptr) {
+            memcpy(stage, w, static_cast<size_t>(n) * d->window_len);
+            w = stage;
+        }
 
-            for (int oc = 0; oc < d->out_c; ++oc) {
-                int32_t acc = esp_nn_dot_s8_aligned_esp32s3(
-                    window, filter + oc * d->window_len, d->window_len);
-                acc += d->correction[oc];
-                acc = esp_nn_multiply_by_quantized_mult(acc, d->mult[oc], d->shift[oc]);
-                acc += d->output_offset;
-                acc = acc < -128 ? -128 : (acc > 127 ? 127 : acc);
-                out[oc] = static_cast<int8_t>(acc);
+        for (int oy = 0; oy < d->in_h; ++oy) {
+            for (int ox = 0; ox < d->in_w; ++ox) {
+                BuildWindow(d, input, window, oy, ox, pad_val);
+
+                int8_t* out = output + (oy * d->in_w + ox) * d->out_c + oc0;
+
+                for (int i = 0; i < n; ++i) {
+                    const int oc = oc0 + i;
+                    int32_t acc = esp_nn_dot_s8_aligned_esp32s3(
+                        window, w + static_cast<size_t>(i) * d->window_len, d->window_len);
+                    acc += d->correction[oc];
+                    acc = esp_nn_multiply_by_quantized_mult(acc, d->mult[oc], d->shift[oc]);
+                    acc += d->output_offset;
+                    acc = acc < -128 ? -128 : (acc > 127 ? 127 : acc);
+                    out[i] = static_cast<int8_t>(acc);
+                }
             }
         }
     }
@@ -245,6 +300,16 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
     micro_context->DeallocateTempTfLiteTensor(input);
     micro_context->DeallocateTempTfLiteTensor(filter);
 
+#if CONV_OPT_STAGE_FILTER
+    {
+        // Vùng đệm đủ cho 1 khối kênh ra (tối đa CONV_OPT_STAGE_BYTES). Nếu 1 kênh ra đã
+        // lớn hơn ngân sách thì bỏ qua staging cho node này.
+        int chunk = CONV_OPT_STAGE_BYTES / data->window_len;
+        if (chunk > out_c) chunk = out_c;
+        if (chunk >= 1) EnsureStaging(static_cast<size_t>(chunk) * data->window_len);
+    }
+#endif
+
     ++g_fast_nodes;
     return context->RequestScratchBufferInArena(context, data->window_len + 15, &data->scratch_idx);
 }
@@ -288,4 +353,12 @@ void ConvOptSetTargets(const ConvOptTarget* targets, int count) {
 
 int ConvOptFastNodeCount() {
     return g_fast_nodes;
+}
+
+int ConvOptStagingBytes() {
+#if CONV_OPT_STAGE_FILTER
+    return static_cast<int>(g_stage_size);
+#else
+    return 0;
+#endif
 }
