@@ -240,9 +240,6 @@ void loop() {
     avgTotal.add(totalMs);
     avgAge.add(ageMs);
 
-    camera.discardFrames(2);
-    delay(50);
-
     Serial.printf("[Perf] cap=%.0fms pre=%.0fms infer=%.0fms dec=%.0fms | total=%.0fms avg5=%.0fms FPS=%.2f age=%.0fms\n",
                   captureMs, preMs, invokeMs, decodeMs,
                   totalMs, avgTotal.get(), 1000.0f / avgTotal.get(), avgAge.get());

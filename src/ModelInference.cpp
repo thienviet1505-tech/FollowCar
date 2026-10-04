@@ -1,9 +1,10 @@
 #include "ModelInference.h"
 #include <Arduino.h>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <esp_heap_caps.h>
-#include "LogisticLut.h" 
+#include "LogisticLut.h"
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -11,6 +12,20 @@
 #include "tensorflow/lite/schema/schema_generated.h"
 
 #include "model_data.h"
+
+// Tắt từng phần để so sánh: thêm vào build_flags  -DMODEL_IN_PSRAM=0  hoặc  -DNN_DUAL_CORE=0
+#ifndef MODEL_IN_PSRAM
+#define MODEL_IN_PSRAM 1
+#endif
+#ifndef NN_DUAL_CORE
+#define NN_DUAL_CORE 1
+#endif
+
+// Đa lõi của ESP-NN (esp-nn/include/esp_nn_multicore.h).
+extern "C" {
+void esp_nn_dual_core_enable(void);
+bool esp_nn_dual_core_active(void);
+}
 
 namespace {
 const tflite::Model* tfl_model = nullptr;
@@ -138,10 +153,28 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
 
     return resolver;
 }
+
+// Chép model từ flash sang PSRAM (căn 16 byte như model_data) để đọc trọng số nhanh hơn.
+const unsigned char* modelInPsram() {
+    unsigned char* p = (unsigned char*)heap_caps_aligned_alloc(16, model_data_len, MALLOC_CAP_SPIRAM);
+    if (!p) {
+        Serial.println("[Model] Khong du PSRAM de chep model, dung ban trong flash");
+        return model_data;
+    }
+    const uint32_t t0 = millis();
+    memcpy(p, model_data, model_data_len);
+    Serial.printf("[Model] Da chep model vao PSRAM: %u byte, %lu ms\n",
+                  (unsigned)model_data_len, (unsigned long)(millis() - t0));
+    return p;
+}
 }  // namespace
 
 bool ModelInference::begin(size_t tensor_arena_size) {
+#if MODEL_IN_PSRAM
+    tfl_model = tflite::GetModel(modelInPsram());
+#else
     tfl_model = tflite::GetModel(model_data);
+#endif
     if (!tfl_model) {
         Serial.println("[ModelInference] tflite::GetModel tra ve null, kiem tra model_data.h");
         return false;
@@ -169,6 +202,11 @@ bool ModelInference::begin(size_t tensor_arena_size) {
         Serial.println("[ModelInference] AllocateTensors that bai");
         return false;
     }
+
+#if NN_DUAL_CORE
+    esp_nn_dual_core_enable();   // gọi từ core chạy suy luận (loopTask)
+    Serial.printf("[Model] ESP-NN dual-core: %s\n", esp_nn_dual_core_active() ? "ON" : "OFF");
+#endif
 
     input_tensor = interpreter->input(0);
     output_tensor = interpreter->output(0);
