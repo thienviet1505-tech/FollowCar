@@ -137,7 +137,7 @@ bool CameraModule::begin() {
     config_.pin_reset    = RESET_GPIO_NUM;
     config_.xclk_freq_hz = 20000000;
     config_.pixel_format = PIXFORMAT_RGB565;  // main.cpp đọc fb->buf theo định dạng này
-    config_.frame_size   = FRAMESIZE_QVGA;    // 320x240, đổi nếu cần ảnh to/nhỏ hơn
+    config_.frame_size   = FRAMESIZE_QQVGA;    // 160x120, đổi nếu cần ảnh to/nhỏ hơn
     config_.fb_count     = 2;
     config_.fb_location  = CAMERA_FB_IN_PSRAM;
     config_.grab_mode    = CAMERA_GRAB_LATEST;  // luôn lấy frame mới nhất (WHEN_EMPTY có thể trả frame cũ khi Invoke chậm)

@@ -5,7 +5,7 @@
 
 namespace {
 // Số class KHÔNG đặt cứng ở đây nữa: lấy từ output tensor [1, 4 + số_class, số_box].
-constexpr float CONF_THRESHOLD = 0.5f;
+constexpr float CONF_THRESHOLD = 0.6f;
 constexpr float NMS_IOU_THRESHOLD = 0.45f;
 
 float iou(const Detection& a, const Detection& b) {
@@ -129,7 +129,7 @@ void Detector::decode(const ModelInference& model, int origWidth, int origHeight
             int padX = (int)std::round(padXf - 0.1f);
             int padY = (int)std::round(padYf - 0.1f);
 
-            // Output model đã normalize theo kích thước input 224x224.
+            // Output model đã normalize theo kích thước input: x, w chia cho modelW; y, h chia cho modelH.
             float cxModel = cx * modelW;
             float cyModel = cy * modelH;
             float wModel = w * modelW;

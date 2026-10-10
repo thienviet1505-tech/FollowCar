@@ -5,7 +5,7 @@
 // Thứ tự: thử nối vào WiFi nhà (STA) trong VIEW_STA_TIMEOUT_MS; nếu không nối
 // được (hoặc VIEW_WIFI_SSID để trống) thì ESP32 tự phát WiFi riêng (AP), khi đó
 // nối laptop vào VIEW_AP_SSID rồi mở http://192.168.4.1
-#define VIEW_WIFI_SSID      "Cuoc Song Tuoi Dep 5G"            // tên WiFi nhà/điện thoại; "" = luôn phát WiFi riêng
+#define VIEW_WIFI_SSID      ""            // tên WiFi nhà/điện thoại; "" = luôn phát WiFi riêng
 #define VIEW_WIFI_PASSWORD  "88889999"
 #define VIEW_STA_TIMEOUT_MS 10000
 #define VIEW_AP_SSID        "ESP32S3-CAM"

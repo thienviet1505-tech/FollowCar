@@ -71,7 +71,7 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
     // Ban đầu toàn bộ canvas là padding.
     std::fill(outBuf, outBuf + needed, padValue);
 
-    // Vẽ ảnh đã resize vào giữa canvas 224x224.
+    // Vẽ ảnh đã resize vào giữa canvas modelW x modelH.
     for (int y = 0; y < resizeH; y++) {
         int dstY = y + padY;
         if (dstY < 0 || dstY >= modelH) continue;
@@ -110,7 +110,7 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
     return true;
 }
 
-// Chay kiem tra model bang anh mau (to tien 100k, 224x224) duoc nhung san trong flash.
+// Chay kiem tra model bang anh mau (to tien 100k, kich thuoc bang input model) duoc nhung san trong flash.
 void runSelfTest(ModelInference& model) {
     Serial.println();
     Serial.println("================ SELF-TEST ================");

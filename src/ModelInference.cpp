@@ -7,6 +7,10 @@
 #include "LogisticLut.h"
 #include "QuantizeLut.h"
 #include "ConvOpt.h"
+#include "ConvOptTune.h"
+#include "PadFast.h"
+#include "TransposeFast.h"
+#include "SoftmaxLut.h"
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -21,6 +25,11 @@
 #endif
 #ifndef NN_DUAL_CORE
 #define NN_DUAL_CORE 1
+#endif
+// Tự đo từng conv 3x3 lúc khởi động và chọn cách chạy nhanh nhất (xem ConvOptTune.h).
+// Tắt: -DCONV_OPT_AUTOTUNE=0 (mọi conv chạy bằng kernel ESP-NN gốc).
+#ifndef CONV_OPT_AUTOTUNE
+#define CONV_OPT_AUTOTUNE 1
 #endif
 // Profiler chỉ bật khi cần:  -DPROFILE_OPS=1  (in bảng thời gian từng op sau mỗi lần invoke).
 #ifndef PROFILE_OPS
@@ -127,7 +136,7 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddNeg();
         resolver.AddNotEqual();
         resolver.AddPack();
-        resolver.AddPad();
+        resolver.AddPad(RegisterPadFast());
         resolver.AddPadV2();
         resolver.AddPrelu();
         resolver.AddQuantize(RegisterQuantizeLut());
@@ -147,7 +156,7 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddShape();
         resolver.AddSin();
         resolver.AddSlice();
-        resolver.AddSoftmax();
+        resolver.AddSoftmax(RegisterSoftmaxLut());
         resolver.AddSpaceToBatchNd();
         resolver.AddSpaceToDepth();
         resolver.AddSplit();
@@ -161,7 +170,7 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddSum();
         resolver.AddSvdf();
         resolver.AddTanh();
-        resolver.AddTranspose();
+        resolver.AddTranspose(RegisterTransposeFast());
         resolver.AddTransposeConv();
         resolver.AddUnidirectionalSequenceLSTM();
         resolver.AddUnpack();
@@ -222,7 +231,7 @@ bool ModelInference::begin(size_t tensor_arena_size) {
         Serial.println("[ModelInference] AllocateTensors that bai");
         return false;
     }
-    Serial.printf("[Model] ConvOpt per-pixel nodes: %d\n", ConvOptFastNodeCount());
+    Serial.printf("[Model] ConvOpt 3x3 nodes: %d\n", ConvOptFastNodeCount());
     Serial.printf("[Model] ConvOpt staging=%d bytes | internal free=%u largest=%u\n",
                   ConvOptStagingBytes(),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
@@ -273,6 +282,30 @@ bool ModelInference::begin(size_t tensor_arena_size) {
         int q = (int)std::lround((v / 255.0f) / input_scale_) + input_zero_point_;
         pixel_lut_[v] = (int8_t)std::max(-128, std::min(127, q));
     }
+
+#if CONV_OPT_AUTOTUNE
+    {
+        // Một lần suy luận thử với ảnh ngẫu nhiên: mỗi conv tự đo các cách chạy và so từng bit
+        // với kernel gốc. Dữ liệu vào là ngẫu nhiên nên bảng profile của lần này bị xoá.
+        int8_t* p = input_tensor->data.int8;
+        uint32_t seed = 12345u;
+        for (size_t i = 0; i < (size_t)input_bytes_; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            p[i] = (int8_t)(seed >> 24);
+        }
+        ConvOptTuneBegin();
+        const bool tuned_ok = interpreter->Invoke() == kTfLiteOk;
+        ConvOptTuneEnd();
+#if PROFILE_OPS
+        profiler.ClearEvents();
+#endif
+        if (!tuned_ok) {
+            Serial.println("[ModelInference] Invoke khi tu do that bai");
+            return false;
+        }
+        ConvOptPrintSummary();
+    }
+#endif
 
     Serial.printf("[Model] input=%dx%dx%d bytes=%d scale=%.6f zp=%d | output type=%d bytes=%d scale=%.6f zp=%d dims=",
                   input_width_, input_height_, input_channels_,
