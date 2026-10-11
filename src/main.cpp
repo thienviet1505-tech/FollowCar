@@ -13,6 +13,10 @@
 
 bool g_triggerSelfTest = false;
 
+// Layout input do ModelInference xác định lúc nạp model (định nghĩa ở phạm vi toàn cục trong ModelInference.cpp).
+// Phải khai báo NGOÀI namespace ẩn danh bên dưới, nếu không linker tìm nhầm ký hiệu trong namespace.
+extern bool g_model_input_nhwc;
+
 namespace {
 CameraModule camera;
 ModelInference model;
@@ -71,7 +75,7 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
     // Ban đầu toàn bộ canvas là padding.
     std::fill(outBuf, outBuf + needed, padValue);
 
-    // Vẽ ảnh đã resize vào giữa canvas modelW x modelH.
+    // Vẽ ảnh đã resize vào giữa canvas 224x224.
     for (int y = 0; y < resizeH; y++) {
         int dstY = y + padY;
         if (dstY < 0 || dstY >= modelH) continue;
@@ -99,10 +103,18 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
 
             size_t pixelIdx = (size_t)dstY * modelW + dstX;
 
-            // NCHW: [R plane][G plane][B plane]
-            outBuf[0 * planeSize + pixelIdx] = lut[r8];
-            outBuf[1 * planeSize + pixelIdx] = lut[g8];
-            outBuf[2 * planeSize + pixelIdx] = lut[b8];
+            if (g_model_input_nhwc) {
+                // NHWC: [R G B] liền nhau cho từng điểm ảnh
+                int8_t* dst = outBuf + pixelIdx * 3;
+                dst[0] = lut[r8];
+                dst[1] = lut[g8];
+                dst[2] = lut[b8];
+            } else {
+                // NCHW: [R plane][G plane][B plane]
+                outBuf[0 * planeSize + pixelIdx] = lut[r8];
+                outBuf[1 * planeSize + pixelIdx] = lut[g8];
+                outBuf[2 * planeSize + pixelIdx] = lut[b8];
+            }
 
         }
     }
@@ -110,7 +122,7 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
     return true;
 }
 
-// Chay kiem tra model bang anh mau (to tien 100k, kich thuoc bang input model) duoc nhung san trong flash.
+// Chay kiem tra model bang anh mau (to tien 100k, 224x224) duoc nhung san trong flash.
 void runSelfTest(ModelInference& model) {
     Serial.println();
     Serial.println("================ SELF-TEST ================");
@@ -123,8 +135,18 @@ void runSelfTest(ModelInference& model) {
     }
     int8_t* in = model.inputData();
     const int8_t* lut = model.pixelLut();
-    for (size_t i = 0; i < TEST_SAMPLE_SIZE; i++) {
-        in[i] = lut[pgm_read_byte(&TEST_SAMPLE_NCHW[i])];
+    if (g_model_input_nhwc) {
+        // Ảnh mẫu lưu NCHW; model NHWC: đổi chỗ khi nạp.
+        const size_t plane = (size_t)TEST_SAMPLE_W * TEST_SAMPLE_H;
+        for (size_t p = 0; p < plane; p++) {
+            for (int c = 0; c < 3; c++) {
+                in[p * 3 + c] = lut[pgm_read_byte(&TEST_SAMPLE_NCHW[c * plane + p])];
+            }
+        }
+    } else {
+        for (size_t i = 0; i < TEST_SAMPLE_SIZE; i++) {
+            in[i] = lut[pgm_read_byte(&TEST_SAMPLE_NCHW[i])];
+        }
     }
 
     const uint32_t t0 = millis();

@@ -41,6 +41,15 @@ extern "C" bool esp_nn_dual_core_active(void);
 extern "C" bool esp_nn_dual_core_run(void (*fn)(void*), void* arg);
 extern "C" void esp_nn_dual_core_wait(void);
 extern "C" void* esp_nn_dual_core_scratch(int size);
+// Kernel 1x1 SIMD của ESP-NN (hợp ngữ, xử lý 8 điểm ảnh một lúc). Filter [out_ch][in_ch], in_ch bội 8,
+// filter căn 16 byte; in_ch/out_ch/bias tính như conv 1x1 thường. scratch >= 24*in_ch + 8*out_ch + 64 byte.
+extern "C" void esp_nn_conv_s8_mult8_1x1_esp32s3(
+    const int8_t* input_data, const uint16_t input_wd, const uint16_t input_ht,
+    const uint16_t in_channels, const int32_t input_offset, const int8_t* filter_aligned,
+    const int32_t* bias, int8_t* out_data, const uint16_t out_wd, const uint16_t out_ht,
+    const uint16_t out_channels, const int32_t out_offset, const int32_t* out_shift,
+    const int32_t* out_mult, const int32_t activation_min, const int32_t activation_max,
+    void* buffer);
 
 struct DotS8 {
     int32_t operator()(const int8_t* a, const int8_t* b, int len) const {
@@ -54,8 +63,8 @@ struct ReqS8 {
 };
 
 // Cách chạy một conv.
-enum Mode { kBase = 0, kOne = 1, kDualOC = 2, kDualPx = 3, kModeCount = 4 };
-const char* const kModeName[kModeCount] = {"base", "one", "dual-oc", "dual-px"};
+enum Mode { kBase = 0, kOne = 1, kDualOC = 2, kDualPx = 3, kIm2col = 4, kModeCount = 5 };
+const char* const kModeName[kModeCount] = {"base", "one", "dual-oc", "dual-px", "im2col"};
 constexpr int kNA = -1;    // cách này không dùng được (không có hai lõi, hoặc không chia được)
 constexpr int kBad = -2;   // kết quả không khớp từng bit với kernel gốc
 
@@ -77,7 +86,7 @@ bool EnsureCoreBuffer() {
 bool g_tune = false;
 int g_node_seq = 0;
 int g_eligible = 0;
-int g_mode_count[kModeCount] = {0, 0, 0, 0};
+int g_mode_count[kModeCount] = {0, 0, 0, 0, 0};
 int64_t g_tune_us = 0;
 
 struct ConvOptData {
@@ -90,6 +99,10 @@ struct ConvOptData {
     convopt::Geom g;
     convopt::Quant q;
     int8_t* packed;          // filter đã căn (wpad byte mỗi hàng) nằm ở SRAM nội; nullptr nếu dùng filter gốc
+    bool i2c_ok;             // mode im2col dùng được (số điểm ảnh chia hết 8, vùng SRAM đủ chứa một khúc)
+    int i2c_chunk;           // số điểm ảnh mỗi khúc im2col (bội 8)
+    const int32_t* bias_raw; // [out_c] bias gốc (đường 1x1 tự cộng phần zero_point)
+    int32_t input_offset;    // = -zero_point của input
 };
 
 TfLiteStatus BaseInvoke(TfLiteContext* context, TfLiteNode* node, ConvOptData* data) {
@@ -129,7 +142,78 @@ bool DualAvailable() {
 #endif
 }
 
-// Chạy theo mode (kOne / kDualOC / kDualPx). Trả false nếu cách này không dùng được
+// Mode im2col: dựng ma trận cửa sổ theo từng khúc nhỏ ngay trong SRAM nội rồi chạy đường 1x1 SIMD của ESP-NN
+// trên khúc đó (xem như ảnh 1x1 với wpad kênh). Không cần ma trận lớn trong PSRAM.
+// Vùng làm việc của mỗi lõi: [scratch của asm | khúc ma trận], nằm trong buffer kCoreBytes.
+struct I2cJob {
+    const ConvOptData* d;
+    const int8_t* in;
+    const int8_t* filt;
+    int8_t* out;
+    int8_t* work;
+    int p0, p1;
+};
+
+inline int I2cScratchBytes(int wpad, int out_c) {
+    return (24 * wpad + 8 * out_c + 128 + 15) & ~15;
+}
+
+void I2cTile(const I2cJob& j) {
+    const convopt::Geom& g = j.d->g;
+    if (j.p1 <= j.p0) return;
+    const int wp = g.wpad;
+    const int chunk = j.d->i2c_chunk;
+    int8_t* scratch = j.work;
+    int8_t* mat = j.work + I2cScratchBytes(wp, g.out_c);
+    memset(mat, 0, static_cast<size_t>(chunk) * wp);   // phần đuôi mỗi hàng giữ 0
+
+    int oy = j.p0 / g.out_w;
+    int ox = j.p0 - oy * g.out_w;
+    for (int p = j.p0; p < j.p1; p += chunk) {
+        const int n = (j.p1 - p) < chunk ? (j.p1 - p) : chunk;
+        for (int k = 0; k < n; ++k) {
+            convopt::BuildWindow(g, j.in, mat + static_cast<size_t>(k) * wp, oy, ox, j.d->q.pad_val);
+            if (++ox == g.out_w) {
+                ox = 0;
+                ++oy;
+            }
+        }
+        esp_nn_conv_s8_mult8_1x1_esp32s3(
+            mat, static_cast<uint16_t>(n), 1, static_cast<uint16_t>(wp), j.d->input_offset, j.filt,
+            j.d->bias_raw, j.out + static_cast<size_t>(p) * g.out_c, static_cast<uint16_t>(n), 1,
+            static_cast<uint16_t>(g.out_c), j.d->q.out_offset, j.d->q.shift, j.d->q.mult, -128, 127, scratch);
+    }
+}
+
+void I2cJobFn(void* arg) {
+    I2cTile(*static_cast<const I2cJob*>(arg));
+}
+
+bool RunIm2col(const ConvOptData* d, const int8_t* in, const int8_t* filt, int8_t* out) {
+    if (!d->i2c_ok || (reinterpret_cast<uintptr_t>(filt) & 15u) != 0) return false;
+    const int pixels = d->g.out_h * d->g.out_w;
+    I2cJob main_job = {d, in, filt, out, g_core_buf, 0, pixels};
+
+    if (DualAvailable() && pixels >= 32) {
+        uint8_t* ws = static_cast<uint8_t*>(esp_nn_dual_core_scratch(kCoreBytes + 16));
+        if (ws != nullptr) {
+            const int mid = (pixels / 2) & ~7;   // hai nửa đều là bội 8 (pixels chia hết 8)
+            I2cJob worker_job = {d, in, filt, out,
+                                 reinterpret_cast<int8_t*>((reinterpret_cast<uintptr_t>(ws) + 15u) & ~uintptr_t(15u)),
+                                 mid, pixels};
+            if (esp_nn_dual_core_run(I2cJobFn, &worker_job)) {
+                main_job.p1 = mid;
+                I2cTile(main_job);
+                esp_nn_dual_core_wait();
+                return true;
+            }
+        }
+    }
+    I2cTile(main_job);
+    return true;
+}
+
+// Chạy theo mode (kOne / kDualOC / kDualPx / kIm2col). Trả false nếu cách này không dùng được
 // (kết quả khi đó chưa được ghi).
 bool RunMode(const ConvOptData* d, int mode, const int8_t* in, const int8_t* filt, int8_t* out) {
     const convopt::Geom& g = d->g;
@@ -137,6 +221,7 @@ bool RunMode(const ConvOptData* d, int mode, const int8_t* in, const int8_t* fil
     int8_t* window = g_core_buf;
     int8_t* stage = d->packed != nullptr ? nullptr : g_core_buf + kWindowBytes;
 
+    if (mode == kIm2col) return RunIm2col(d, in, filt, out);
     if (mode == kOne) {
         RunOne(d, in, filt, out, window, stage, 0, pixels, 0, g.out_c);
         return true;
@@ -185,7 +270,7 @@ TfLiteStatus Tune(TfLiteContext* context, TfLiteNode* node, ConvOptData* d,
     int64_t t0 = esp_timer_get_time();
     st = BaseInvoke(context, node, d);
     if (st != kTfLiteOk) return st;
-    int us[kModeCount] = {static_cast<int>(esp_timer_get_time() - t0), kNA, kNA, kNA};
+    int us[kModeCount] = {static_cast<int>(esp_timer_get_time() - t0), kNA, kNA, kNA, kNA};
 
     int8_t* ref = static_cast<int8_t*>(heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (ref != nullptr) {
@@ -218,11 +303,11 @@ TfLiteStatus Tune(TfLiteContext* context, TfLiteNode* node, ConvOptData* d,
     ++g_mode_count[d->mode];
 
 #if CONV_OPT_REPORT
-    // Đơn vị us. one/oc/px: -1 = không dùng được, -2 = lệch kết quả so với kernel gốc.
-    MicroPrintf("[Tune] #%d s%d %dx%dx%d>%dx%dx%d base=%d one=%d oc=%d px=%d -> %s",
+    // Đơn vị us. one/oc/px/i2c: -1 = không dùng được, -2 = lệch kết quả so với kernel gốc.
+    MicroPrintf("[Tune] #%d s%d %dx%dx%d>%dx%dx%d base=%d one=%d oc=%d px=%d i2c=%d -> %s",
                 d->index, d->g.stride, d->g.in_h, d->g.in_w, d->g.in_c,
                 d->g.out_h, d->g.out_w, d->g.out_c,
-                us[kBase], us[kOne], us[kDualOC], us[kDualPx], kModeName[d->mode]);
+                us[kBase], us[kOne], us[kDualOC], us[kDualPx], us[kIm2col], kModeName[d->mode]);
 #endif
     g_tune_us += esp_timer_get_time() - t_start;
     return kTfLiteOk;
@@ -325,7 +410,7 @@ TfLiteStatus PrepareFast(TfLiteContext* context, TfLiteNode* node, ConvOptData* 
     int8_t* packed = nullptr;
     if (ok) {
         buf = static_cast<int32_t*>(
-            context->AllocatePersistentBuffer(context, 3 * g.out_c * sizeof(int32_t)));
+            context->AllocatePersistentBuffer(context, 4 * g.out_c * sizeof(int32_t)));
         if (buf == nullptr) {
             status = kTfLiteError;
             ok = false;
@@ -381,6 +466,26 @@ TfLiteStatus PrepareFast(TfLiteContext* context, TfLiteNode* node, ConvOptData* 
             corr[oc] = (bias != nullptr ? bias[oc] : 0) + filter_sum * input_offset;
         }
 
+        // bias gốc (không cộng phần zero_point) cho đường 1x1 của ESP-NN
+        int32_t* bias_raw = buf + 3 * g.out_c;
+        for (int oc = 0; oc < g.out_c; ++oc) bias_raw[oc] = bias != nullptr ? bias[oc] : 0;
+        data->bias_raw = bias_raw;
+        data->input_offset = input_offset;
+
+        // Mode im2col: số điểm ảnh phải chia hết 8 (đường dư của asm 1x1 chậm hơn nhiều) và một khúc
+        // (>= 8 điểm ảnh) phải nằm vừa cùng scratch của asm trong buffer SRAM của mỗi lõi.
+        data->i2c_ok = false;
+        data->i2c_chunk = 0;
+        if (((g.out_h * g.out_w) % 8) == 0 && (g.wpad % 8) == 0 && g.out_c <= 512) {
+            int chunk = (kCoreBytes - I2cScratchBytes(g.wpad, g.out_c)) / g.wpad;
+            if (chunk * g.wpad > 12288) chunk = 12288 / g.wpad;   // khúc <= 12 KB cho gọn
+            chunk &= ~7;
+            if (chunk >= 8) {
+                data->i2c_chunk = chunk;
+                data->i2c_ok = true;
+            }
+        }
+
         data->g = g;
         data->packed = packed;
         data->eligible = true;
@@ -399,6 +504,8 @@ TfLiteStatus Prepare(TfLiteContext* context, TfLiteNode* node) {
     }
     auto* data = static_cast<ConvOptData*>(node->user_data);
     data->index = ++g_node_seq;
+    data->i2c_ok = false;
+    data->i2c_chunk = 0;
     data->eligible = false;
     data->tuned = false;
     data->mode = kBase;
@@ -469,7 +576,7 @@ void ConvOptTuneEnd() {
 }
 
 void ConvOptPrintSummary() {
-    MicroPrintf("[ConvOpt] %d conv 3x3 | base=%d one=%d dual-oc=%d dual-px=%d | tune %d ms",
+    MicroPrintf("[ConvOpt] %d conv 3x3 | base=%d one=%d dual-oc=%d dual-px=%d im2col=%d | tune %d ms",
                 g_eligible, g_mode_count[kBase], g_mode_count[kOne], g_mode_count[kDualOC],
-                g_mode_count[kDualPx], static_cast<int>(g_tune_us / 1000));
+                g_mode_count[kDualPx], g_mode_count[kIm2col], static_cast<int>(g_tune_us / 1000));
 }

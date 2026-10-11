@@ -11,6 +11,8 @@
 #include "PadFast.h"
 #include "TransposeFast.h"
 #include "SoftmaxLut.h"
+#include "SiluLut.h"
+#include "ConcatLut.h"
 
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
@@ -51,6 +53,9 @@ void* esp_nn_dual_core_scratch(int size);
 #define NN_SCRATCH_PREALLOC 65536
 #endif
 
+// true: input model là [1,H,W,3] (NHWC); false: [1,3,H,W] (NCHW). main.cpp dùng (ngoài namespace ẩn danh để main.cpp thấy được) để ghi ảnh đúng layout.
+bool g_model_input_nhwc = false;
+
 namespace {
 const tflite::Model* tfl_model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
@@ -67,7 +72,7 @@ static bool profile_printed = false;
 #define PROFILER_PTR nullptr
 #endif
 
-constexpr int kNumOps = 103;
+constexpr int kNumOps = 105;  // 103 op + 2 op tuỳ biến (FusedSiLU, FusedConcat)
 
 tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
     static tflite::MicroMutableOpResolver<kNumOps> resolver;
@@ -177,6 +182,11 @@ tflite::MicroMutableOpResolver<kNumOps>& GetResolver() {
         resolver.AddVarHandle();
         resolver.AddWhile();
         resolver.AddZerosLike();
+        // Op tuỳ biến do notebook v5 tạo ra (gộp LOGISTIC+MUL và QUANTIZE+CONCATENATION).
+        static TFLMRegistration silu_reg = RegisterSiluLut();
+        static TFLMRegistration concat_reg = RegisterConcatLut();
+        resolver.AddCustom("FusedSiLU", &silu_reg);
+        resolver.AddCustom("FusedConcat", &concat_reg);
         initialized = true;
     }
 
@@ -264,10 +274,19 @@ bool ModelInference::begin(size_t tensor_arena_size) {
         return false;
     }
 
-    // Model input shape: [1, C, H, W] = NCHW.
-    input_channels_ = input_tensor->dims->data[1];
-    input_height_ = input_tensor->dims->data[2];
-    input_width_ = input_tensor->dims->data[3];
+    // Model input shape: [1, C, H, W] (NCHW) hoặc [1, H, W, C] (NHWC, bản đã bỏ TRANSPOSE đầu).
+    // Nhận biết theo vị trí kênh 3; main.cpp đọc g_model_input_nhwc để ghi đúng layout.
+    if (input_tensor->dims->data[3] == 3 && input_tensor->dims->data[1] != 3) {
+        g_model_input_nhwc = true;
+        input_height_ = input_tensor->dims->data[1];
+        input_width_ = input_tensor->dims->data[2];
+        input_channels_ = input_tensor->dims->data[3];
+    } else {
+        g_model_input_nhwc = false;
+        input_channels_ = input_tensor->dims->data[1];
+        input_height_ = input_tensor->dims->data[2];
+        input_width_ = input_tensor->dims->data[3];
+    }
 
     input_bytes_ = input_tensor->bytes;
     input_scale_ = input_tensor->params.scale;
