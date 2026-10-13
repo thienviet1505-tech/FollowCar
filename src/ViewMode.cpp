@@ -62,6 +62,7 @@ void startView() {
 
     Serial.printf("[View] Mo trinh duyet: http://%s   (luong anh o cong 81)\n", ip.toString().c_str());
     Serial.println("[View] Chinh thanh truot tren web, xong go 'p' de lay thong so, go 'd' de ve nhan dien");
+    Serial.println("[View] Chup dataset: bam Start Stream, roi nut 'Chup anh' (hoac Space), xem lai, bam 'Tai ZIP'");
 }
 
 void stopView(CameraModule& camera) {
