@@ -2,10 +2,11 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <cmath>
+#include "RobotConfig.h"
 
 namespace {
 // Số class KHÔNG đặt cứng ở đây nữa: lấy từ output tensor [1, 4 + số_class, số_box].
-constexpr float CONF_THRESHOLD = 0.6f;
+constexpr float CONF_THRESHOLD = Cfg::DETECT_CONF_THRESHOLD;   // chỉnh trong RobotConfig.h
 constexpr float NMS_IOU_THRESHOLD = 0.45f;
 
 float iou(const Detection& a, const Detection& b) {

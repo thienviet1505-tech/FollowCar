@@ -23,6 +23,7 @@ bool active();
 // Đọc lệnh 1 ký tự từ Serial:
 //   v = vào chế độ xem ảnh     d = về chế độ nhận diện
 //   p = in thông số camera     m = in RAM còn trống     ? = trợ giúp
+// Cùng hàm này xử lý nút G0 (BOOT): bấm = đổi qua lại v <-> d.
 void handleSerial(CameraModule& camera);
 
 }  // namespace ViewMode

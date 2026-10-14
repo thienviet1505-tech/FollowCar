@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_heap_caps.h>
+#include "Robot.h"
 
 namespace {
 
@@ -20,6 +21,7 @@ void printHelp() {
     Serial.println("[Lenh] t = chay lai self-test voi anh mau to 100k");
     Serial.println("[Lenh] p = in thong so camera hien tai de dan vao CameraModule.cpp");
     Serial.println("[Lenh] m = in RAM con trong    ? = tro giup");
+    Serial.println("[Nut ] G0 (BOOT) = doi qua lai giua v va d (xe tu dung khi vao che do xem anh)");
 }
 
 void startView() {
@@ -77,6 +79,18 @@ void stopView(CameraModule& camera) {
     Serial.println("[Mode] DETECT");
 }
 
+// Vào/ra chế độ xem ảnh: xe phải dừng trước khi bật WiFi, và chỉ được chạy lại sau khi về DETECT.
+void enterView() {
+    Robot::setEnabled(false);
+    startView();
+    if (!s_active) Robot::setEnabled(true);   // bật WiFi thất bại -> ở lại DETECT
+}
+
+void leaveView(CameraModule& camera) {
+    stopView(camera);
+    Robot::setEnabled(true);
+}
+
 }  // namespace
 
 extern bool g_triggerSelfTest;
@@ -86,15 +100,20 @@ namespace ViewMode {
 bool active() { return s_active; }
 
 void handleSerial(CameraModule& camera) {
+    // Nut G0: doi qua lai v <-> d (task dieu khien da tu dung xe ngay luc bam)
+    if (Robot::takeButtonPress()) {
+        if (s_active) leaveView(camera);
+        else enterView();
+    }
     while (Serial.available()) {
         char c = (char)Serial.read();
         switch (c) {
             case 'v': case 'V':
                 if (s_active) Serial.println("[Mode] Dang o che do VIEW roi");
-                else startView();
+                else enterView();
                 break;
             case 'd': case 'D':
-                if (s_active) stopView(camera);
+                if (s_active) leaveView(camera);
                 else Serial.println("[Mode] Dang o che do DETECT roi");
                 break;
             case 't': case 'T':

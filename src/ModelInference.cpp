@@ -35,7 +35,7 @@
 #endif
 // Profiler chỉ bật khi cần:  -DPROFILE_OPS=1  (in bảng thời gian từng op sau mỗi lần invoke).
 #ifndef PROFILE_OPS
-#define PROFILE_OPS 1
+#define PROFILE_OPS 0
 #endif
 
 // Đa lõi của ESP-NN (esp-nn/include/esp_nn_multicore.h).

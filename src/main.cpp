@@ -9,6 +9,9 @@
 #include "Detector.h"
 #include "SerialLogger.h"
 #include "ViewMode.h"
+#include "Robot.h"
+#include "RobotConfig.h"
+#include "RobotMath.h"
 #include "test_sample.h"
 
 bool g_triggerSelfTest = false;
@@ -28,8 +31,9 @@ struct Avg5 {
     void add(float x) { v[idx] = x; idx = (idx + 1) % 5; if (n < 5) n++; }
     float get() const { float s = 0; for (int i = 0; i < n; i++) s += v[i]; return n ? s / n : 0.0f; }
 };
-Avg5 avgTotal, avgAge;
+Avg5 avgTotal, avgAge, avgLoop;
 uint32_t frameId = 0;
+int64_t prevFrameStartUs = 0;   // 0 = chưa có frame trước (để tính chu kỳ thực của loop)
 
 
 // Resize nearest-neighbor từ framebuffer RGB565 xuống đúng kích thước input.
@@ -189,6 +193,7 @@ void setup() {
 
     runSelfTest(model);
     camera.discardFrames(3);
+    Robot::begin();   // cảm biến + động cơ + task điều khiển (robot phải đứng yên ~1.5 s)
     Serial.println("[Boot] detect ready");
 
     Serial.printf("[Boot] internal free=%u largest=%u\n",
@@ -202,26 +207,36 @@ void loop() {
         g_triggerSelfTest = false;
         runSelfTest(model);
         camera.discardFrames(3);
+        prevFrameStartUs = 0;
         return;
     }
     if (ViewMode::active()) {
+        prevFrameStartUs = 0;
+        // Ở chế độ xem ảnh xe thả trôi: in encoder mỗi 1 giây để lăn tay hiệu chỉnh GEAR_RATIO / kiểm tra dấu.
+        static uint32_t lastViewPrintMs = 0;
+        if (millis() - lastViewPrintMs >= 1000) {
+            lastViewPrintMs = millis();
+            Robot::printFrameLine();
+        }
         delay(50);
         return;
     }
 
     const uint32_t currentFrame = ++frameId;
-    Serial.println();
-    Serial.println("============================================================");
-    Serial.printf("[Frame %lu]\n", (unsigned long)currentFrame);
+    const int64_t tFrame0 = esp_timer_get_time();
+    // Chu kỳ thực của loop = từ lúc bắt đầu frame trước đến lúc bắt đầu frame này (đã gồm thời gian in Serial).
+    if (prevFrameStartUs) avgLoop.add((tFrame0 - prevFrameStartUs) / 1000.0f);
+    prevFrameStartUs = tFrame0;
+    // Dòng ngăn cách ngắn (1 dòng ~20 byte ~ 2ms; bản cũ ~80 byte ~ 7ms ở 115200 baud)
+    Serial.printf("==== Frame %lu ====\n", (unsigned long)currentFrame);
 
-    const int64_t tLoop0 = esp_timer_get_time();
+    const int64_t tLoop0 = esp_timer_get_time();   // pipeline đo từ đây (không tính thời gian in)
     const int64_t tCap0 = esp_timer_get_time();
     camera_fb_t* fb = camera.capture();
     const int64_t tCap1 = esp_timer_get_time();
 
     if (!fb) {
         Serial.println("[Capture] FAIL");
-        Serial.println("------------------------------------------------------------");
         delay(100);
         return;
     }
@@ -238,7 +253,6 @@ void loop() {
 
     if (!ok) {
         Serial.println("[Preprocess] FAIL");
-        Serial.println("------------------------------------------------------------");
         delay(50);
         return;
     }
@@ -246,7 +260,6 @@ void loop() {
     const int64_t tInv0 = esp_timer_get_time();
     if (!model.invoke()) {
         Serial.println("[Inference] FAIL");
-        Serial.println("------------------------------------------------------------");
         delay(50);
         return;
     }
@@ -256,6 +269,14 @@ void loop() {
     const int64_t tDec0 = esp_timer_get_time();
     Detector::decode(model, origW, origH, detections);
     const int64_t tDec1 = esp_timer_get_time();
+
+    // Chọn tờ TARGET_CLASS lớn nhất, báo cho tầng điều khiển (góc lệch + thời điểm chụp để bù độ trễ).
+    const Detection* target = nullptr;
+    for (const Detection& d : detections) {
+        if (d.class_id == Cfg::TARGET_CLASS && (!target || d.area() > target->area())) target = &d;
+    }
+    Robot::onDetection(target != nullptr, target ? RM::bearingDeg((float)target->cx, (float)origW) : 0.0f,
+                       tCap1 - (int64_t)(ageMs * 1000.0f));
 
     // Đo đến đây để không tính thời gian in Serial vào hiệu năng pipeline.
     const float totalMs = (tDec1 - tLoop0) / 1000.0f;
@@ -267,9 +288,11 @@ void loop() {
     avgTotal.add(totalMs);
     avgAge.add(ageMs);
 
-    Serial.printf("[Perf] cap=%.0fms pre=%.0fms infer=%.0fms dec=%.0fms | total=%.0fms avg5=%.0fms FPS=%.2f age=%.0fms\n",
+    // FPS_pipe = chỉ tính chụp+tiền xử lý+suy luận+giải mã. FPS_loop = chu kỳ thực của cả vòng loop (có cả thời gian in Serial).
+    const float fpsLoop = avgLoop.n ? 1000.0f / avgLoop.get() : 0.0f;
+    Serial.printf("[Perf] cap=%.0fms pre=%.0fms infer=%.0fms dec=%.0fms | total=%.0fms avg5=%.0fms FPS_pipe=%.2f age=%.0fms | FPS_loop=%.2f\n",
                   captureMs, preMs, invokeMs, decodeMs,
-                  totalMs, avgTotal.get(), 1000.0f / avgTotal.get(), avgAge.get());
+                  totalMs, avgTotal.get(), 1000.0f / avgTotal.get(), avgAge.get(), fpsLoop);
     SerialLogger::logFrameResult(detections, origW, origH);
-    Serial.println("------------------------------------------------------------");
+    Robot::printFrameLine();
 }
