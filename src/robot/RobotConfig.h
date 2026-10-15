@@ -13,7 +13,7 @@ namespace Cfg {
 constexpr int TARGET_CLASS = 2;                        // lớp tiền cần bám: 0=100k 1=10k 2=50k 3=5k
 constexpr float DETECT_CONF_THRESHOLD = 0.5f;          // ngưỡng nhận diện
 
-constexpr uint16_t FOLLOW_DISTANCE_MM = 200;           // khoảng cách giữ với tờ tiền (20 cm)
+constexpr uint16_t FOLLOW_DISTANCE_MM = 300;           // khoảng cách giữ với tờ tiền (20 cm)
 constexpr float FOLLOW_DEADBAND_MM = 15.0f;            // sai lệch nhỏ hơn mức này thì đứng yên (chống dao động tới lui)
 constexpr float KP_DIST = 2.0f;                        // vận tốc (mm/s) = KP_DIST * (sai lệch khoảng cách mm)
 constexpr float V_FWD_MAX_MM_S = 150.0f;               // tốc độ tiến tối đa khi bám
@@ -25,10 +25,10 @@ constexpr int BEARING_SIGN = +1;                       // đổi thành -1 nếu
 
 constexpr float ROTATE_ONLY_DEG = 50.0f;               // lệch hơn mức này: chỉ quay tại chỗ, không tiến/lùi
 constexpr float TOF_USE_BEARING_DEG = 15.0f;           // chỉ tin ToF là khoảng cách tới tiền khi lệch hướng dưới mức này
-constexpr float HEAD_KP = 4.0f;                        // omega (do/s) = HEAD_KP * sai_lech_huong (do)
+constexpr float HEAD_KP = 6.0f;                        // omega (do/s) = HEAD_KP * sai_lech_huong (do)
 constexpr float HEAD_TOL_DEG = 3.0f;                   // lệch dưới mức này coi như đã thẳng hướng
-constexpr float MAX_TURN_DPS = 120.0f;                 // tốc độ quay tối đa
-constexpr float MIN_TURN_DPS = 30.0f;                  // quay tại chỗ chậm hơn mức này bánh không nhúc nhích nổi
+constexpr float MAX_TURN_DPS = 180.0f;                 // tốc độ quay tối đa
+constexpr float MIN_TURN_DPS = 50.0f;                  // quay tại chỗ chậm hơn mức này bánh không nhúc nhích nổi
 
 constexpr uint32_t LOST_TIMEOUT_MS = 500;              // không thấy tiền quá lâu -> LOST (dừng, phanh)
 constexpr int REACQUIRE_FRAMES = 2;                    // cần thấy tiền liên tiếp bao nhiêu frame mới bám lại sau LOST
@@ -88,10 +88,10 @@ constexpr float COUNTS_PER_WHEEL_REV = ENC_PULSES_PER_MOTOR_REV * 4.0f * GEAR_RA
 //   PWM_DEADBAND = pwm1 - s * v1
 //   V_AT_PWM_MAX = (PWM_MAX - PWM_DEADBAND) / s
 constexpr float V_AT_PWM_MAX_MM_S = 600.0f;            // ước lượng, nên đo lại
-constexpr float PWM_DEADBAND = 20.0f;                  // ước lượng, nên đo lại
+constexpr float PWM_DEADBAND = 60.0f;                  // ước lượng, nên đo lại
 
 // ============================== VÒNG ĐIỀU KHIỂN NHANH ========================
-constexpr int CTRL_PERIOD_MS = 10;                     // 100 Hz
+constexpr int CTRL_PERIOD_MS = 10;                     // 100 HzDETECT_CONF_THRESHOLD 
 constexpr int CTRL_CORE = 0;                           // loop() chạy lõi 1
 constexpr int CTRL_TASK_PRIO = 20;                     // cao hơn worker ESP-NN; nếu ctl= trong [Robot] thường > 15ms thì xem lại
 constexpr int CTRL_TASK_STACK = 8192;
