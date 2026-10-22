@@ -16,6 +16,7 @@ struct Det {
     uint32_t seq = 0;
     bool seen = false;
     float bearing = 0;
+    float boxRatio = 0;
     int64_t frameUs = 0;
 };
 
@@ -28,10 +29,10 @@ volatile uint32_t s_btnCount = 0, s_btnTaken = 0;
 const char* modeName(Mode m) {
     switch (m) {
         case Mode::CALIB: return "CALIB";
-        case Mode::VIEW: return "VIEW";
-        case Mode::LOST: return "LOST";
+        case Mode::VIEW:  return "VIEW";
+        case Mode::LOST:  return "LOST";
         case Mode::TRACK: return "TRACK";
-        default: return "BLOCK";
+        default:          return "BLOCK";
     }
 }
 
@@ -50,16 +51,23 @@ void controlTask(void*) {
     uint32_t lastSeenMs = 0;
     int seenStreak = 0;
     float yawTarget = 0;
+    bool hasYawTarget = false;
+    float filtBoxRatio = 0;
+    uint16_t visDistMm = TOF_NONE_MM;
     bool dispSeen = false;
     float dispBearing = 0;
 
     float vL = 0, vR = 0, tgtL = 0, tgtR = 0;
-    int32_t ePrevL = 0, ePrevR = 0;
+    // Cửa sổ encoder SPEED_WINDOW_TICKS chu kỳ để đo vận tốc bánh (giảm nhiễu lượng tử hóa 1 xung/chu kỳ)
+    constexpr int W = SPEED_WINDOW_TICKS + 1;
+    int32_t wEncL[W] = {0}, wEncR[W] = {0};
+    int64_t wT[W] = {0};
+    int wHead = 0, wCount = 0;
+    auto resetSpeedWindow = [&]() { wHead = 0; wCount = 0; vL = vR = 0; };
     int pwmL = 0, pwmR = 0;
     float winMax = 0, dtShown = 0;
     int winTicks = 0;
 
-    // nút G0: chỉ tính khi đã thấy nhả ra ít nhất 1 lần (tránh lúc bật nguồn đang giữ nút)
     bool btnArmed = false, btnFired = false;
     uint32_t btnLowSince = 0;
     pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -67,8 +75,7 @@ void controlTask(void*) {
     uint32_t btnPresses = 0;
 
     Sensors::update(0.0f, rd);
-    ePrevL = rd.encL;
-    ePrevR = rd.encR;
+    resetSpeedWindow();
 
     TickType_t last = xTaskGetTickCount();
     int64_t tPrev = esp_timer_get_time();
@@ -79,9 +86,17 @@ void controlTask(void*) {
         mode = m;
         modeSince = millis();
         coasted = false;
-        pidL.reset();
-        pidR.reset();
+        // Chỉ xóa PID (dừng cứng) khi vào VIEW/CALIB. Với LOST/TRACK/BLOCKED giữ đà để giảm tốc/đổi tốc êm.
+        if (m == Mode::VIEW || m == Mode::CALIB) {
+            pidL.reset();
+            pidR.reset();
+        }
         tgtL = tgtR = 0;
+        if (m == Mode::LOST || m == Mode::VIEW || m == Mode::CALIB) {
+            hasYawTarget = false;
+            filtBoxRatio = 0;
+            visDistMm = TOF_NONE_MM;
+        }
     };
 
     for (;;) {
@@ -99,19 +114,25 @@ void controlTask(void*) {
         // ---- cảm biến + vận tốc bánh ----
         Sensors::update(dt < 0.1f ? dt : 0.1f, rd);
         hist.push(now, rd.yawDeg);
-        if (dt > 0.0f) {
-            const float rawL = RM::countsPerSecToMmPerSec((float)(rd.encL - ePrevL) / dt);
-            const float rawR = RM::countsPerSecToMmPerSec((float)(rd.encR - ePrevR) / dt);
-            vL += SPEED_FILTER_ALPHA * (rawL - vL);
-            vR += SPEED_FILTER_ALPHA * (rawR - vR);
+        wEncL[wHead] = rd.encL;
+        wEncR[wHead] = rd.encR;
+        wT[wHead] = now;
+        wHead = (wHead + 1) % W;
+        if (wCount < W) wCount++;
+        if (wCount >= 2) {
+            const int newest = (wHead - 1 + W) % W;
+            const int oldest = (wHead - wCount + W) % W;
+            const float span = (float)(wT[newest] - wT[oldest]) * 1e-6f;
+            if (span > 0.0f) {
+                vL = RM::countsPerSecToMmPerSec((float)(wEncL[newest] - wEncL[oldest]) / span);
+                vR = RM::countsPerSecToMmPerSec((float)(wEncR[newest] - wEncR[oldest]) / span);
+            }
         }
-        ePrevL = rd.encL;
-        ePrevR = rd.encR;
 
         // ---- nút G0 ----
         btnRaw = digitalRead(BUTTON_PIN);
         const bool btnLow = (btnRaw == LOW);
-        if (btnRaw != btnRawPrev) {     // chẩn đoán: in ngay mọi lần chân đổi mức, chưa qua chống dội
+        if (btnRaw != btnRawPrev) {
             Serial.println(btnLow ? "[Robot] G0 xuong" : "[Robot] G0 len");
             btnRawPrev = btnRaw;
         }
@@ -124,7 +145,7 @@ void controlTask(void*) {
             if (nowMs - btnLowSince >= (uint32_t)BUTTON_DEBOUNCE_MS) {
                 btnFired = true;
                 btnPresses++;
-                s_enabled = false;     // dừng ngay; loop() sẽ đổi chế độ rồi bật lại khi cần
+                s_enabled = false;
                 portENTER_CRITICAL(&s_mux);
                 s_btnCount++;
                 portEXIT_CRITICAL(&s_mux);
@@ -144,9 +165,19 @@ void controlTask(void*) {
             if (det.seen) {
                 seenStreak++;
                 lastSeenMs = nowMs;
-                yawTarget = hist.at(det.frameUs, rd.yawDeg) + det.bearing;   // yaw lúc chụp + góc lệch
+                const float rawYawT = hist.at(det.frameUs, rd.yawDeg) + det.bearing;
+                if (!hasYawTarget) {
+                    yawTarget = rawYawT;
+                    filtBoxRatio = det.boxRatio;
+                    hasYawTarget = true;
+                } else {
+                    yawTarget += YAW_TARGET_FILTER_ALPHA * (rawYawT - yawTarget);
+                    filtBoxRatio += BOX_RATIO_FILTER_ALPHA * (det.boxRatio - filtBoxRatio);
+                }
+                visDistMm = RM::estimateVisualDistMm(filtBoxRatio);
             } else {
-                seenStreak = 0;
+                // Giảm dần seenStreak thay vì xóa trắng ngay nếu mới hụt 1 frame
+                if (seenStreak > 0) seenStreak--;
             }
         }
 
@@ -162,9 +193,7 @@ void controlTask(void*) {
                 if (Sensors::calibrateGyro()) {
                     hist.clear();
                     Sensors::update(0.0f, rd);
-                    ePrevL = rd.encL;
-                    ePrevR = rd.encR;
-                    vL = vR = 0;
+                    resetSpeedWindow();
                     seenStreak = 0;
                     setMode(enabled ? Mode::LOST : Mode::VIEW);
                 } else {
@@ -181,7 +210,9 @@ void controlTask(void*) {
         }
 
         if (mode == Mode::LOST) {
-            if (seenStreak >= REACQUIRE_FRAMES && (nowMs - lastSeenMs) <= LOST_TIMEOUT_MS && rd.imuGood) setMode(Mode::TRACK);
+            if (seenStreak >= REACQUIRE_FRAMES && (nowMs - lastSeenMs) <= LOST_TIMEOUT_MS && rd.imuGood) {
+                setMode(Mode::TRACK);
+            }
         } else if (mode == Mode::TRACK || mode == Mode::BLOCKED) {
             if (!rd.imuGood) {
                 Serial.println("[Robot] IMU loi -> dung");
@@ -197,13 +228,27 @@ void controlTask(void*) {
             }
         }
 
-        // ---- đầu ra ----
+        // ---- đầu ra điều khiển ----
         if (mode == Mode::TRACK || mode == Mode::BLOCKED) {
-            RM::FollowCmd c = RM::followLaw(yawTarget - rd.yawDeg, rd.tofMm, tofFresh);
-            if (!tofFresh || mode == Mode::BLOCKED) c.v = fminf(c.v, 0.0f);   // không có ToF tươi / quá gần: cấm tiến
+            RM::FollowCmd c = RM::followLaw(yawTarget - rd.yawDeg, rd.tofMm, tofFresh, visDistMm);
+            // Nếu ToF báo có vật cản sát (< TOF_STOP_MM), khóa chiều tiến (nhưng vẫn cho phép xoay hướng theo tiền)
+            if (mode == Mode::BLOCKED) {
+                c.v = fminf(c.v, 0.0f);
+            }
             RM::wheelTargets(c, tgtL, tgtR);
             pidL.target = tgtL;
             pidR.target = tgtR;
+            float fl, fr;
+            const bool bl = pidL.step(vL, dtc, fl);
+            const bool br = pidR.step(vR, dtc, fr);
+            pwmL = bl ? 0 : (int)lroundf(fl);
+            pwmR = br ? 0 : (int)lroundf(fr);
+            Drive::setPwm(pwmL, pwmR);
+        } else if (mode == Mode::LOST) {
+            // Mất tiền: giảm tốc êm theo ACCEL_MM_S2 (đích = 0), chỉ phanh khi đã dừng hẳn
+            tgtL = tgtR = 0;
+            pidL.target = 0;
+            pidR.target = 0;
             float fl, fr;
             const bool bl = pidL.step(vL, dtc, fl);
             const bool br = pidR.step(vR, dtc, fr);
@@ -214,10 +259,10 @@ void controlTask(void*) {
             tgtL = tgtR = 0;
             pwmL = pwmR = 0;
             if (mode == Mode::VIEW && !coasted && (nowMs - modeSince) >= (uint32_t)BRAKE_HOLD_MS) {
-                Drive::coast();         // thả trôi để lăn tay đo encoder
+                Drive::coast();
                 coasted = true;
             } else if (!coasted) {
-                Drive::setPwm(0, 0);    // phanh
+                Drive::setPwm(0, 0);
             }
         }
 
@@ -227,7 +272,7 @@ void controlTask(void*) {
         s.yawDeg = rd.yawDeg; s.rateDps = rd.rateDps; s.yawTargetDeg = yawTarget;
         s.imuGood = rd.imuGood;
         s.seen = dispSeen; s.bearingDeg = dispBearing;
-        s.tofMm = rd.tofMm; s.tofAgeMs = rd.tofAgeMs;
+        s.tofMm = rd.tofMm; s.visMm = visDistMm; s.boxRatio = filtBoxRatio; s.tofAgeMs = rd.tofAgeMs;
         s.encL = rd.encL; s.encR = rd.encR;
         s.vL = vL; s.vR = vR; s.tgtL = tgtL; s.tgtR = tgtR;
         s.pwmL = pwmL; s.pwmR = pwmR;
@@ -245,15 +290,15 @@ void controlTask(void*) {
 namespace Robot {
 
 void begin() {
-    Drive::begin();                  // phanh ngay
+    Drive::begin();
     Sensors::begin();
     if (!Sensors::tofPresent()) {
-        Serial.println("[Robot] CANH BAO: khong co ToF -> xe chi quay, khong tien/lui");
+        Serial.println("[Robot] CANH BAO: khong co ToF -> dung khoang cach uoc luong tu Camera BBox");
     }
     xTaskCreatePinnedToCore(controlTask, "robotctl", CTRL_TASK_STACK, nullptr, CTRL_TASK_PRIO, nullptr, CTRL_CORE);
-    Serial.printf("[Robot] Task dieu khien %d Hz, lo %d, uu tien %d | lop tien muc tieu=%d | giu %u mm\n",
+    Serial.printf("[Robot] Task dieu khien %d Hz, loi %d, uu tien %d | lop tien=%d | dung cach %u mm\n",
                   1000 / CTRL_PERIOD_MS, CTRL_CORE, CTRL_TASK_PRIO, TARGET_CLASS, (unsigned)FOLLOW_DISTANCE_MM);
-    Serial.printf("[Robot] GEAR_RATIO=%.1f V_AT_PWM_MAX=%.0f PWM_DEADBAND=%.0f HFOV=%.0f (uoc luong - xem huong dan trong RobotConfig.h)\n",
+    Serial.printf("[Robot] GEAR_RATIO=%.1f V_AT_PWM_MAX=%.0f PWM_DEADBAND=%.0f HFOV=%.0f\n",
                   GEAR_RATIO, V_AT_PWM_MAX_MM_S, PWM_DEADBAND, CAMERA_HFOV_DEG);
 }
 
@@ -268,11 +313,12 @@ bool takeButtonPress() {
     return r;
 }
 
-void onDetection(bool seen, float bearingDeg, int64_t frameTimeUs) {
+void onDetection(bool seen, float bearingDeg, float boxRatio, int64_t frameTimeUs) {
     portENTER_CRITICAL(&s_mux);
     s_det.seq++;
     s_det.seen = seen;
     s_det.bearing = bearingDeg;
+    s_det.boxRatio = boxRatio;
     s_det.frameUs = frameTimeUs;
     portEXIT_CRITICAL(&s_mux);
 }
@@ -287,14 +333,17 @@ State state() {
 
 void printFrameLine() {
     const State s = state();
-    char tof[8], brg[10];
+    char tof[8], vis[8], brg[10];
     if (s.tofMm >= TOF_NONE_MM) snprintf(tof, sizeof tof, "--");
     else snprintf(tof, sizeof tof, "%u", (unsigned)s.tofMm);
+    if (s.visMm >= TOF_NONE_MM) snprintf(vis, sizeof vis, "--");
+    else snprintf(vis, sizeof vis, "%u", (unsigned)s.visMm);
     if (s.seen) snprintf(brg, sizeof brg, "%+.1f", s.bearingDeg);
     else snprintf(brg, sizeof brg, "--");
-    Serial.printf("[Robot] %s brg=%s yawT=%+.1f yaw=%+.1f%s | tof=%s | v=%.0f/%.0f tgt=%.0f/%.0f pwm=%d/%d | enc=%ld/%ld | ctl=%.1fms | btn=%d/%lu\n",
-                  modeName(s.mode), brg, s.yawTargetDeg, s.yawDeg, s.imuGood ? "" : "!", tof, s.vL, s.vR, s.tgtL, s.tgtR,
-                  s.pwmL, s.pwmR, (long)s.encL, (long)s.encR, s.ctlDtMaxMs, s.btnLevel, (unsigned long)s.btnPresses);
+    Serial.printf("[Robot] %s brg=%s yawT=%+.1f yaw=%+.1f%s | tof=%s vis=%s ratio=%.2f | v=%.0f/%.0f tgt=%.0f/%.0f pwm=%d/%d | enc=%ld/%ld | ctl=%.1fms | btn=%d/%lu\n",
+                  modeName(s.mode), brg, s.yawTargetDeg, s.yawDeg, s.imuGood ? "" : "!", tof, vis, s.boxRatio,
+                  s.vL, s.vR, s.tgtL, s.tgtR, s.pwmL, s.pwmR, (long)s.encL, (long)s.encR,
+                  s.ctlDtMaxMs, s.btnLevel, (unsigned long)s.btnPresses);
 }
 
 }  // namespace Robot

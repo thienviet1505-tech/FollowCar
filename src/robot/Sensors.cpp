@@ -22,11 +22,15 @@ int s_badImu = 0;
 bool s_imuGood = false;
 float s_rate = 0;
 
+// ---- ZUPT (Zero-Velocity Update: khóa trôi gyro khi 2 bánh đứng yên) ----
+int32_t s_prevEncL = 0, s_prevEncR = 0;
+int s_stationaryTicks = 0;
+
 // ---- ToF ----
 uint16_t s_tofMm = TOF_NONE_MM;
 uint32_t s_tofStampMs = 0;
 
-// ---- Encoder (giải mã vuông pha 4x, bảng giống robot_test.ino) ----
+// ---- Encoder (giải mã vuông pha 4x) ----
 volatile int32_t s_encL = 0, s_encR = 0;
 volatile uint8_t s_stL = 0, s_stR = 0;
 const int8_t QEM[16] = {0, 1, -1, 0, -1, 0, 0, 1, 1, 0, 0, -1, 0, -1, 1, 0};
@@ -76,7 +80,7 @@ void begin() {
     Serial.printf("[Sensors] MPU6050 %s | VL53L0X %s\n", s_imuOk ? "OK" : "KHONG THAY",
                   s_tofOk ? "OK" : "KHONG THAY");
     if (!s_imuOk || !s_tofOk) {
-        Serial.println("[Sensors] Kiem tra day SDA(G1)/SCL(G2)/nguon. Neu camera da chiem I2C port 0 thi bao lai de doi sang Wire1.");
+        Serial.println("[Sensors] Kiem tra day SDA(G1)/SCL(G2)/nguon.");
     }
 }
 
@@ -105,7 +109,7 @@ bool calibrateGyro() {
     const float n = (float)GYRO_CAL_SAMPLES;
     const float am = sqrtf(sa[0] * sa[0] + sa[1] * sa[1] + sa[2] * sa[2]) / n;
     if (range > GYRO_CAL_MAX_RANGE_DPS || am < 7.0f || am > 12.5f) {
-        Serial.printf("[Gyro] HIEU CHINH THAT BAI: robot dang rung/di chuyen? (dao dong=%.1f do/s, |a|=%.1f m/s2). Giu nguyen gia tri cu.\n",
+        Serial.printf("[Gyro] HIEU CHINH THAT BAI: robot dang rung/di chuyen? (dao dong=%.1f do/s, |a|=%.1f m/s2).\n",
                       range, am);
         return false;
     }
@@ -114,32 +118,58 @@ bool calibrateGyro() {
         s_up[k] = (sa[k] / n) / am;
     }
     s_yaw = 0;
+    s_prevEncL = ENC_SIGN_L * s_encL;
+    s_prevEncR = ENC_SIGN_R * s_encR;
+    s_stationaryTicks = 0;
     Serial.printf("[Gyro] bias=(%.2f,%.2f,%.2f) do/s | up=(%.2f,%.2f,%.2f) | dao dong=%.2f do/s\n",
                   s_bias[0], s_bias[1], s_bias[2], s_up[0], s_up[1], s_up[2], range);
     return true;
 }
 
 void update(float dt, Reading& out) {
+    const int32_t curEncL = ENC_SIGN_L * s_encL;
+    const int32_t curEncR = ENC_SIGN_R * s_encR;
+    const bool wheelsMoved = (curEncL != s_prevEncL) || (curEncR != s_prevEncR);
+    s_prevEncL = curEncL;
+    s_prevEncR = curEncR;
+
+    if (wheelsMoved) {
+        s_stationaryTicks = 0;
+    } else if (s_stationaryTicks < 1000) {
+        s_stationaryTicks++;
+    }
+
     if (s_imuOk) {
         sensors_event_t a, g, t;
         mpu.getEvent(&a, &g, &t);
         const float am = sqrtf(a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y +
                                a.acceleration.z * a.acceleration.z);
-        if (am < 4.0f || am > 25.0f) {          // đọc lỗi thường trả về toàn số 0
+        if (am < 4.0f || am > 25.0f) {
             if (++s_badImu >= 5) s_imuGood = false;
         } else {
             s_badImu = 0;
             s_imuGood = true;
-            const float gd[3] = {g.gyro.x * RM::RAD2DEG - s_bias[0], g.gyro.y * RM::RAD2DEG - s_bias[1],
-                                 g.gyro.z * RM::RAD2DEG - s_bias[2]};
-            s_rate = RM::yawRateDps(gd, s_up);
-            s_yaw += s_rate * dt;
+            const float rawG[3] = {g.gyro.x * RM::RAD2DEG, g.gyro.y * RM::RAD2DEG, g.gyro.z * RM::RAD2DEG};
+            const float gd[3] = {rawG[0] - s_bias[0], rawG[1] - s_bias[1], rawG[2] - s_bias[2]};
+            const float rawRate = RM::yawRateDps(gd, s_up);
+
+            // ZUPT: Nếu 2 bánh đứng yên đủ lâu và tốc độ góc nhỏ (chỉ là nhiễu/trôi nhiệt),
+            // khóa tích phân góc yaw và cập nhật mượt lại bias để triệt tiêu trôi góc.
+            if (s_stationaryTicks >= ZUPT_HOLD_TICKS && fabsf(rawRate) < ZUPT_MAX_RATE_DPS) {
+                for (int k = 0; k < 3; k++) {
+                    s_bias[k] += GYRO_BIAS_ADAPT_ALPHA * (rawG[k] - s_bias[k]);
+                }
+                s_rate = 0.0f;
+            } else {
+                s_rate = rawRate;
+                s_yaw += s_rate * dt;
+            }
         }
     }
 
     if (s_tofOk && tof.isRangeComplete()) {
         const uint16_t r = tof.readRangeResult();
-        if (tof.Status == VL53L0X_ERROR_NONE) {   // lỗi I2C -> không làm mới dấu thời gian
+        if (tof.Status == VL53L0X_ERROR_NONE) {
             s_tofMm = (r == 0xffff || r >= TOF_MAX_MM) ? TOF_NONE_MM : r;
             s_tofStampMs = millis();
         }
@@ -150,8 +180,8 @@ void update(float dt, Reading& out) {
     out.imuGood = s_imuGood;
     out.tofMm = s_tofMm;
     out.tofAgeMs = s_tofOk ? (millis() - s_tofStampMs) : 0xFFFFFFFFu;
-    out.encL = ENC_SIGN_L * s_encL;
-    out.encR = ENC_SIGN_R * s_encR;
+    out.encL = curEncL;
+    out.encR = curEncR;
 }
 
 }  // namespace Sensors

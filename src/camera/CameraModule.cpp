@@ -37,7 +37,7 @@ SensorTuning makeOV2640() {
     SensorTuning t;
     t.aec2 = 1;
     t.ae_level = 1;
-    t.brightness = 1;
+    t.brightness = 0;
     t.gainceiling = GAINCEILING_8X;
     return t;
 }

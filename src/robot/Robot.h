@@ -1,15 +1,8 @@
 #pragma once
 #include <stdint.h>
 
-// Tầng điều khiển nhanh: 1 task FreeRTOS (100 Hz, lõi 0) lo IMU, ToF, encoder, PID bánh, nút G0, an toàn
-// và máy trạng thái bám theo. loop() (nhận diện ảnh, ~6 FPS) chỉ báo kết quả nhận diện và đọc trạng thái.
 namespace Robot {
 
-//  CALIB   : đang hiệu chỉnh gyro (xe phải đứng yên); chưa cho chạy
-//  VIEW    : chế độ xem ảnh ('v'), xe dừng
-//  LOST    : chế độ nhận diện nhưng chưa thấy tiền (hoặc vừa mất), xe dừng + phanh
-//  TRACK   : đang bám tiền
-//  BLOCKED : đang bám nhưng ToF báo quá gần, cấm tiến (vẫn quay / lùi được)
 enum class Mode : uint8_t { CALIB, VIEW, LOST, TRACK, BLOCKED };
 
 struct State {
@@ -18,28 +11,34 @@ struct State {
     bool imuGood = false;
     bool seen = false;             // frame nhận diện gần nhất có thấy tiền không
     float bearingDeg = 0;          // góc lệch của tiền ở frame đó
-    uint16_t tofMm = 9999;
+    uint16_t tofMm = 9999;         // khoảng cách đo bằng VL53L0X (mm)
+    uint16_t visMm = 9999;         // khoảng cách ước lượng từ kích thước Bounding Box (mm)
+    float boxRatio = 0;            // max(w,h)/bề rộng ảnh đã lọc (0 = chưa có)
     uint32_t tofAgeMs = 0;
     int32_t encL = 0, encR = 0;
     float vL = 0, vR = 0;          // mm/s đo được
     float tgtL = 0, tgtR = 0;      // mm/s đích
     int pwmL = 0, pwmR = 0;
-    float ctlDtMaxMs = 0;          // chu kỳ dài nhất của vòng điều khiển trong ~2 s gần nhất
-    int btnLevel = 1;              // mức thô chân G0 (1 = nhả, 0 = đang bấm)
-    uint32_t btnPresses = 0;       // số lần bấm đã được nhận (sau chống dội)
+    float ctlDtMaxMs = 0;
+    int btnLevel = 1;
+    uint32_t btnPresses = 0;
 };
 
-void begin();                      // gọi 1 lần trong setup(); gyro tự hiệu chỉnh trong task (xe phải đứng yên)
+void begin();
 
-// true = chế độ nhận diện/bám; false = xem ảnh (xe dừng). Gọi từ ViewMode.
 void setEnabled(bool on);
-// true 1 lần cho mỗi lần bấm nút G0 (đã chống dội). Lúc bấm, xe đã tự dừng ngay trong task điều khiển.
 bool takeButtonPress();
 
-// Gọi mỗi frame nhận diện. frameTimeUs: thời điểm chụp frame (đồng hồ esp_timer_get_time()).
-void onDetection(bool seen, float bearingDeg, int64_t frameTimeUs);
+// Gọi mỗi frame nhận diện.
+// boxRatio: max(w, h) / origW của tờ tiền (0 nếu không thấy), dùng để ước lượng khoảng cách khi giơ tiền cao.
+void onDetection(bool seen, float bearingDeg, float boxRatio, int64_t frameTimeUs);
+
+// Overload 3 tham số để tương thích ngược nếu gọi kiểu cũ
+inline void onDetection(bool seen, float bearingDeg, int64_t frameTimeUs) {
+    onDetection(seen, bearingDeg, 0.0f, frameTimeUs);
+}
 
 State state();
-void printFrameLine();             // 1 dòng gọn, in mỗi frame (và mỗi 1 s khi ở chế độ xem ảnh)
+void printFrameLine();
 
 }  // namespace Robot

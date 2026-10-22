@@ -15,16 +15,12 @@
 #include "test_sample.h"
 
 bool g_triggerSelfTest = false;
-
-// Layout input do ModelInference xác định lúc nạp model (định nghĩa ở phạm vi toàn cục trong ModelInference.cpp).
-// Phải khai báo NGOÀI namespace ẩn danh bên dưới, nếu không linker tìm nhầm ký hiệu trong namespace.
 extern bool g_model_input_nhwc;
 
 namespace {
 CameraModule camera;
 ModelInference model;
 
-// Trung bình trượt 5 frame gần nhất cho tổng thời gian xử lý và tuổi frame.
 struct Avg5 {
     float v[5] = {0, 0, 0, 0, 0};
     int n = 0, idx = 0;
@@ -33,12 +29,43 @@ struct Avg5 {
 };
 Avg5 avgTotal, avgAge, avgLoop;
 uint32_t frameId = 0;
-int64_t prevFrameStartUs = 0;   // 0 = chưa có frame trước (để tính chu kỳ thực của loop)
+int64_t prevFrameStartUs = 0;
+bool s_holdingTarget = false;   // trạng thái giữ mục tiêu cho ngưỡng kép (Hysteresis)
 
+const char* className(int id) {
+    static const char* const kNames[] = {"100k", "10k", "50k", "5k"};
+    return (id >= 0 && id < 4) ? kNames[id] : "?";
+}
 
-// Resize nearest-neighbor từ framebuffer RGB565 xuống đúng kích thước input.
-// Model sử dụng layout NCHW: [1, 3, H, W]. outBuf là tensor input int8,
-// lut là bảng đổi pixel 0..255 -> int8 (ModelInference::pixelLut()).
+void printDetectionsLog(const std::vector<Detection>& detections, int origW, int origH) {
+    if (detections.empty()) {
+        Serial.println("[Detect] none");
+        return;
+    }
+    uint32_t classMask = 0;
+    const Detection* largest = &detections[0];
+    float maxArea = largest->w * largest->h;
+    for (const auto& d : detections) {
+        if (d.class_id >= 0 && d.class_id < 32) classMask |= (1u << d.class_id);
+        const float area = d.w * d.h;
+        if (area > maxArea) {
+            maxArea = area;
+            largest = &d;
+        }
+    }
+    int numClasses = 0;
+    for (uint32_t m = classMask; m; m >>= 1) numClasses += (m & 1u);
+
+    const int boxW = (int)std::lround(largest->w);
+    const int boxH = (int)std::lround(largest->h);
+    const int offX = (int)std::lround(largest->cx - origW * 0.5f);
+    const int offY = (int)std::lround(largest->cy - origH * 0.5f);
+
+    Serial.printf("[Detect] n=%u | classes=%d | largest=%s score=%.3f box=%dx%d offset=(%+d,%+d)px\n",
+                  (unsigned)detections.size(), numClasses, className(largest->class_id),
+                  largest->score, boxW, boxH, offX, offY);
+}
+
 bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const int8_t* lut,
                      int modelW, int modelH, int modelC) {
     if (modelC != 3) {
@@ -56,7 +83,6 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
     int srcW = fb->width;
     int srcH = fb->height;
 
-    // Letterbox: giữ nguyên tỉ lệ ảnh, sau đó padding về modelW x modelH.
     float scaleW = (float)modelW / (float)srcW;
     float scaleH = (float)modelH / (float)srcH;
     float scale = std::min(scaleW, scaleH);
@@ -67,19 +93,13 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
     float padXf = (modelW - resizeW) / 2.0f;
     float padYf = (modelH - resizeH) / 2.0f;
 
-    // Cách làm tròn gần với Ultralytics LetterBox.
     int padX = (int)std::round(padXf - 0.1f);
     int padY = (int)std::round(padYf - 0.1f);
 
     size_t planeSize = (size_t)modelW * modelH;
-
-    // Ultralytics dùng padding màu 114.
     const int8_t padValue = lut[114];
-
-    // Ban đầu toàn bộ canvas là padding.
     std::fill(outBuf, outBuf + needed, padValue);
 
-    // Vẽ ảnh đã resize vào giữa canvas 224x224.
     for (int y = 0; y < resizeH; y++) {
         int dstY = y + padY;
         if (dstY < 0 || dstY >= modelH) continue;
@@ -108,25 +128,21 @@ bool preprocessFrame(camera_fb_t* fb, int8_t* outBuf, size_t outBufSize, const i
             size_t pixelIdx = (size_t)dstY * modelW + dstX;
 
             if (g_model_input_nhwc) {
-                // NHWC: [R G B] liền nhau cho từng điểm ảnh
                 int8_t* dst = outBuf + pixelIdx * 3;
                 dst[0] = lut[r8];
                 dst[1] = lut[g8];
                 dst[2] = lut[b8];
             } else {
-                // NCHW: [R plane][G plane][B plane]
                 outBuf[0 * planeSize + pixelIdx] = lut[r8];
                 outBuf[1 * planeSize + pixelIdx] = lut[g8];
                 outBuf[2 * planeSize + pixelIdx] = lut[b8];
             }
-
         }
     }
 
     return true;
 }
 
-// Chay kiem tra model bang anh mau (to tien 100k, 224x224) duoc nhung san trong flash.
 void runSelfTest(ModelInference& model) {
     Serial.println();
     Serial.println("================ SELF-TEST ================");
@@ -140,7 +156,6 @@ void runSelfTest(ModelInference& model) {
     int8_t* in = model.inputData();
     const int8_t* lut = model.pixelLut();
     if (g_model_input_nhwc) {
-        // Ảnh mẫu lưu NCHW; model NHWC: đổi chỗ khi nạp.
         const size_t plane = (size_t)TEST_SAMPLE_W * TEST_SAMPLE_H;
         for (size_t p = 0; p < plane; p++) {
             for (int c = 0; c < 3; c++) {
@@ -193,7 +208,7 @@ void setup() {
 
     runSelfTest(model);
     camera.discardFrames(3);
-    Robot::begin();   // cảm biến + động cơ + task điều khiển (robot phải đứng yên ~1.5 s)
+    Robot::begin();
     Serial.println("[Boot] detect ready");
 
     Serial.printf("[Boot] internal free=%u largest=%u\n",
@@ -212,7 +227,7 @@ void loop() {
     }
     if (ViewMode::active()) {
         prevFrameStartUs = 0;
-        // Ở chế độ xem ảnh xe thả trôi: in encoder mỗi 1 giây để lăn tay hiệu chỉnh GEAR_RATIO / kiểm tra dấu.
+        s_holdingTarget = false;
         static uint32_t lastViewPrintMs = 0;
         if (millis() - lastViewPrintMs >= 1000) {
             lastViewPrintMs = millis();
@@ -224,75 +239,110 @@ void loop() {
 
     const uint32_t currentFrame = ++frameId;
     const int64_t tFrame0 = esp_timer_get_time();
-    // Chu kỳ thực của loop = từ lúc bắt đầu frame trước đến lúc bắt đầu frame này (đã gồm thời gian in Serial).
     if (prevFrameStartUs) avgLoop.add((tFrame0 - prevFrameStartUs) / 1000.0f);
     prevFrameStartUs = tFrame0;
-    // Dòng ngăn cách ngắn (1 dòng ~20 byte ~ 2ms; bản cũ ~80 byte ~ 7ms ở 115200 baud)
     Serial.printf("==== Frame %lu ====\n", (unsigned long)currentFrame);
 
-    const int64_t tLoop0 = esp_timer_get_time();   // pipeline đo từ đây (không tính thời gian in)
+    const int64_t tLoop0 = esp_timer_get_time();
     const int64_t tCap0 = esp_timer_get_time();
     camera_fb_t* fb = camera.capture();
     const int64_t tCap1 = esp_timer_get_time();
 
     if (!fb) {
-        Serial.println("[Capture] FAIL");
-        delay(100);
+        Serial.println("[Camera] capture FAIL");
+        Robot::onDetection(false, 0.0f, 0.0f, tCap1);
+        Robot::printFrameLine();
+        delay(10);
         return;
     }
 
-    const float ageMs = (tCap1 - ((int64_t)fb->timestamp.tv_sec * 1000000LL + fb->timestamp.tv_usec)) / 1000.0f;
     const int origW = fb->width;
     const int origH = fb->height;
+    const int64_t frameTimeUs = (fb->timestamp.tv_sec > 0)
+        ? ((int64_t)fb->timestamp.tv_sec * 1000000LL + (int64_t)fb->timestamp.tv_usec)
+        : ((tCap0 + tCap1) / 2);
 
     const int64_t tPre0 = esp_timer_get_time();
-    const bool ok = preprocessFrame(fb, model.inputData(), model.inputBytes(), model.pixelLut(),
-                                    model.inputWidth(), model.inputHeight(), model.inputChannels());
-    const int64_t tPre1 = esp_timer_get_time();
+    const bool preOk = preprocessFrame(
+        fb, model.inputData(), model.inputBytes(), model.pixelLut(),
+        TEST_SAMPLE_W, TEST_SAMPLE_H, 3
+    );
     camera.release(fb);
+    const int64_t tPre1 = esp_timer_get_time();
 
-    if (!ok) {
-        Serial.println("[Preprocess] FAIL");
-        delay(50);
+    if (!preOk) {
+        Robot::onDetection(false, 0.0f, 0.0f, frameTimeUs);
+        Robot::printFrameLine();
         return;
     }
 
-    const int64_t tInv0 = esp_timer_get_time();
-    if (!model.invoke()) {
-        Serial.println("[Inference] FAIL");
-        delay(50);
+    const int64_t tInf0 = esp_timer_get_time();
+    const bool infOk = model.invoke();
+    const int64_t tInf1 = esp_timer_get_time();
+
+    if (!infOk) {
+        Serial.println("[NN] invoke FAIL");
+        Robot::onDetection(false, 0.0f, 0.0f, frameTimeUs);
+        Robot::printFrameLine();
         return;
     }
-    const int64_t tInv1 = esp_timer_get_time();
 
-    std::vector<Detection> detections;
     const int64_t tDec0 = esp_timer_get_time();
+    std::vector<Detection> detections;
     Detector::decode(model, origW, origH, detections);
     const int64_t tDec1 = esp_timer_get_time();
 
-    // Chọn tờ TARGET_CLASS lớn nhất, báo cho tầng điều khiển (góc lệch + thời điểm chụp để bù độ trễ).
-    const Detection* target = nullptr;
-    for (const Detection& d : detections) {
-        if (d.class_id == Cfg::TARGET_CLASS && (!target || d.area() > target->area())) target = &d;
-    }
-    Robot::onDetection(target != nullptr, target ? RM::bearingDeg((float)target->cx, (float)origW) : 0.0f,
-                       tCap1 - (int64_t)(ageMs * 1000.0f));
-
-    // Đo đến đây để không tính thời gian in Serial vào hiệu năng pipeline.
+    const float capMs   = (tCap1 - tCap0) / 1000.0f;
+    const float preMs   = (tPre1 - tPre0) / 1000.0f;
+    const float inferMs = (tInf1 - tInf0) / 1000.0f;
+    const float decMs   = (tDec1 - tDec0) / 1000.0f;
     const float totalMs = (tDec1 - tLoop0) / 1000.0f;
-    const float captureMs = (tCap1 - tCap0) / 1000.0f;
-    const float preMs = (tPre1 - tPre0) / 1000.0f;
-    const float invokeMs = (tInv1 - tInv0) / 1000.0f;
-    const float decodeMs = (tDec1 - tDec0) / 1000.0f;
+    const float ageMs   = (tDec1 - frameTimeUs) / 1000.0f;
 
     avgTotal.add(totalMs);
     avgAge.add(ageMs);
 
-    // FPS_pipe = chỉ tính chụp+tiền xử lý+suy luận+giải mã. FPS_loop = chu kỳ thực của cả vòng loop (có cả thời gian in Serial).
-    const float fpsLoop = avgLoop.n ? 1000.0f / avgLoop.get() : 0.0f;
+    const float avg5Ms  = avgTotal.get();
+    const float fpsPipe = (avg5Ms > 0.0f) ? (1000.0f / avg5Ms) : 0.0f;
+    const float loopMs  = avgLoop.get();
+    const float fpsLoop = (loopMs > 0.0f) ? (1000.0f / loopMs) : 0.0f;
+
     Serial.printf("[Perf] cap=%.0fms pre=%.0fms infer=%.0fms dec=%.0fms | total=%.0fms avg5=%.0fms FPS_pipe=%.2f age=%.0fms | FPS_loop=%.2f\n",
-                  captureMs, preMs, invokeMs, decodeMs,
-                  totalMs, avgTotal.get(), 1000.0f / avgTotal.get(), avgAge.get(), fpsLoop);
-    SerialLogger::logFrameResult(detections, origW, origH);
+                  capMs, preMs, inferMs, decMs, totalMs, avg5Ms, fpsPipe, avgAge.get(), fpsLoop);
+
+    const std::vector<float>& mx = Detector::classMaxScores();
+    if (mx.size() >= 4) {
+        Serial.printf("[Score] max: 100k=%.3f 10k=%.3f 50k=%.3f 5k=%.3f\n",
+                      mx[0], mx[1], mx[2], mx[3]);
+    }
+
+    printDetectionsLog(detections, origW, origH);
+
+    // ---- Chọn mục tiêu thuộc TARGET_CLASS với ngưỡng kép (Hysteresis) ----
+    const float minConf = s_holdingTarget ? Cfg::DETECT_HOLD_THRESH : Cfg::DETECT_ACQUIRE_THRESH;
+    const Detection* bestTarget = nullptr;
+    float bestArea = -1.0f;
+
+    for (const auto& d : detections) {
+        if (d.class_id == Cfg::TARGET_CLASS && d.score >= minConf) {
+            const float area = d.w * d.h;
+            if (area > bestArea) {
+                bestArea = area;
+                bestTarget = &d;
+            }
+        }
+    }
+
+    if (bestTarget) {
+        s_holdingTarget = true;
+        const float brg = RM::bearingDeg(bestTarget->cx, (float)origW);
+        const float maxSide = std::max(bestTarget->w, bestTarget->h);
+        const float boxRatio = (origW > 0) ? (maxSide / (float)origW) : 0.0f;
+        Robot::onDetection(true, brg, boxRatio, frameTimeUs);
+    } else {
+        s_holdingTarget = false;
+        Robot::onDetection(false, 0.0f, 0.0f, frameTimeUs);
+    }
+
     Robot::printFrameLine();
 }
