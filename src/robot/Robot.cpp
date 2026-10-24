@@ -5,6 +5,7 @@
 #include "RobotMath.h"
 #include "Sensors.h"
 #include "Drive.h"
+#include "BleLog.h"
 
 using namespace Cfg;
 
@@ -40,6 +41,7 @@ void controlTask(void*) {
     Sensors::Reading rd;
     RM::WheelPid pidL, pidR;
     RM::YawHistory hist;
+    RM::YawHistory odoHist;     // lịch sử quãng đường (mm), dùng lại cấu trúc của YawHistory
 
     Mode mode = Mode::CALIB;
     uint32_t modeSince = millis();
@@ -53,6 +55,9 @@ void controlTask(void*) {
     float yawTarget = 0;
     bool hasYawTarget = false;
     float filtBoxRatio = 0;
+    float visBaseMm = 0, visBaseOdo = 0;       // khoảng cách ước lượng từ box tại lúc chụp frame + quãng đường lúc đó
+    bool hasVis = false;
+    bool holdDist = false;                     // đang ở vùng dừng 15cm (trễ Schmitt trong followLaw)
     uint16_t visDistMm = TOF_NONE_MM;
     bool dispSeen = false;
     float dispBearing = 0;
@@ -83,6 +88,7 @@ void controlTask(void*) {
     auto setMode = [&](Mode m) {
         if (m == mode) return;
         Serial.printf("[Robot] %s -> %s\n", modeName(mode), modeName(m));
+        BleLog::log("MODE %s->%s", modeName(mode), modeName(m));
         mode = m;
         modeSince = millis();
         coasted = false;
@@ -94,6 +100,8 @@ void controlTask(void*) {
         tgtL = tgtR = 0;
         if (m == Mode::LOST || m == Mode::VIEW || m == Mode::CALIB) {
             hasYawTarget = false;
+            hasVis = false;
+            holdDist = false;
             filtBoxRatio = 0;
             visDistMm = TOF_NONE_MM;
         }
@@ -114,6 +122,8 @@ void controlTask(void*) {
         // ---- cảm biến + vận tốc bánh ----
         Sensors::update(dt < 0.1f ? dt : 0.1f, rd);
         hist.push(now, rd.yawDeg);
+        const float odo = RM::countsToMm(0.5f * (float)(rd.encL + rd.encR));   // quay tại chỗ thì 2 bánh triệt tiêu nhau
+        odoHist.push(now, odo);
         wEncL[wHead] = rd.encL;
         wEncR[wHead] = rd.encR;
         wT[wHead] = now;
@@ -134,6 +144,7 @@ void controlTask(void*) {
         const bool btnLow = (btnRaw == LOW);
         if (btnRaw != btnRawPrev) {
             Serial.println(btnLow ? "[Robot] G0 xuong" : "[Robot] G0 len");
+            BleLog::log("G0 %s", btnLow ? "xuong" : "len");
             btnRawPrev = btnRaw;
         }
         if (!btnLow) {
@@ -150,6 +161,7 @@ void controlTask(void*) {
                 s_btnCount++;
                 portEXIT_CRITICAL(&s_mux);
                 Serial.println("[Robot] Nut G0 -> dung xe");
+                BleLog::log("G0 -> dung xe");
             }
         }
 
@@ -165,20 +177,39 @@ void controlTask(void*) {
             if (det.seen) {
                 seenStreak++;
                 lastSeenMs = nowMs;
-                const float rawYawT = hist.at(det.frameUs, rd.yawDeg) + det.bearing;
+                // Hướng tuyệt đối của tiền (tại lúc chụp frame), lọc mượt giữa các frame
+                const float z = hist.at(det.frameUs, rd.yawDeg) + det.bearing;
                 if (!hasYawTarget) {
-                    yawTarget = rawYawT;
-                    filtBoxRatio = det.boxRatio;
+                    yawTarget = z;
                     hasYawTarget = true;
                 } else {
-                    yawTarget += YAW_TARGET_FILTER_ALPHA * (rawYawT - yawTarget);
-                    filtBoxRatio += BOX_RATIO_FILTER_ALPHA * (det.boxRatio - filtBoxRatio);
+                    yawTarget += YAW_TARGET_FILTER_ALPHA * (z - yawTarget);
                 }
-                visDistMm = RM::estimateVisualDistMm(filtBoxRatio);
+                // Khoảng cách từ box, trộn với giá trị cũ đã trừ quãng đường xe đi được từ lúc đó đến lúc chụp frame
+                const uint16_t meas = RM::estimateVisualDistMm(det.boxRatio);
+                if (meas < TOF_NONE_MM) {
+                    const float odoF = DIST_DEAD_RECKON ? odoHist.at(det.frameUs, odo) : 0.0f;
+                    if (hasVis) {
+                        const float pred = visBaseMm - (DIST_DEAD_RECKON ? odoF - visBaseOdo : 0.0f);
+                        visBaseMm = pred + BOX_RATIO_FILTER_ALPHA * ((float)meas - pred);
+                    } else {
+                        visBaseMm = (float)meas;
+                        hasVis = true;
+                    }
+                    visBaseMm = RM::clampf(visBaseMm, 50.0f, (float)TOF_MAX_MM);
+                    visBaseOdo = odoF;
+                    filtBoxRatio = (float)FOLLOW_DISTANCE_MM * BOX_RATIO_AT_FOLLOW_DIST / visBaseMm;
+                }
             } else {
                 // Giảm dần seenStreak thay vì xóa trắng ngay nếu mới hụt 1 frame
                 if (seenStreak > 0) seenStreak--;
             }
+        }
+
+        // Khoảng cách hiện tại = khoảng cách lúc chụp - quãng đường đã đi từ đó (không chạy theo số cũ khi hụt frame)
+        if (hasVis) {
+            visDistMm = (uint16_t)RM::clampf(visBaseMm - (DIST_DEAD_RECKON ? odo - visBaseOdo : 0.0f),
+                                             50.0f, (float)TOF_MAX_MM);
         }
 
         // ---- máy trạng thái ----
@@ -192,6 +223,7 @@ void controlTask(void*) {
                 Serial.println("[Robot] Hieu chinh gyro 1.5 s - giu xe DUNG YEN");
                 if (Sensors::calibrateGyro()) {
                     hist.clear();
+                    odoHist.clear();
                     Sensors::update(0.0f, rd);
                     resetSpeedWindow();
                     seenStreak = 0;
@@ -216,6 +248,7 @@ void controlTask(void*) {
         } else if (mode == Mode::TRACK || mode == Mode::BLOCKED) {
             if (!rd.imuGood) {
                 Serial.println("[Robot] IMU loi -> dung");
+                BleLog::log("IMU loi -> dung");
                 seenStreak = 0;
                 setMode(Mode::LOST);
             } else if (nowMs - lastSeenMs > LOST_TIMEOUT_MS) {
@@ -230,7 +263,7 @@ void controlTask(void*) {
 
         // ---- đầu ra điều khiển ----
         if (mode == Mode::TRACK || mode == Mode::BLOCKED) {
-            RM::FollowCmd c = RM::followLaw(yawTarget - rd.yawDeg, rd.tofMm, tofFresh, visDistMm);
+            RM::FollowCmd c = RM::followLaw(yawTarget - rd.yawDeg, rd.rateDps, rd.tofMm, tofFresh, visDistMm, holdDist);
             // Nếu ToF báo có vật cản sát (< TOF_STOP_MM), khóa chiều tiến (nhưng vẫn cho phép xoay hướng theo tiền)
             if (mode == Mode::BLOCKED) {
                 c.v = fminf(c.v, 0.0f);
@@ -243,9 +276,9 @@ void controlTask(void*) {
             const bool br = pidR.step(vR, dtc, fr);
             pwmL = bl ? 0 : (int)lroundf(fl);
             pwmR = br ? 0 : (int)lroundf(fr);
-            Drive::setPwm(pwmL, pwmR);
+            Drive::setPwm(pwmL, pwmR, !COAST_AT_ZERO);
         } else if (mode == Mode::LOST) {
-            // Mất tiền: giảm tốc êm theo ACCEL_MM_S2 (đích = 0), chỉ phanh khi đã dừng hẳn
+            // Mất tiền: giảm tốc êm theo ACCEL_MM_S2 (đích = 0)
             tgtL = tgtR = 0;
             pidL.target = 0;
             pidR.target = 0;
@@ -254,7 +287,7 @@ void controlTask(void*) {
             const bool br = pidR.step(vR, dtc, fr);
             pwmL = bl ? 0 : (int)lroundf(fl);
             pwmR = br ? 0 : (int)lroundf(fr);
-            Drive::setPwm(pwmL, pwmR);
+            Drive::setPwm(pwmL, pwmR, !COAST_AT_ZERO);
         } else {
             tgtL = tgtR = 0;
             pwmL = pwmR = 0;
@@ -344,6 +377,10 @@ void printFrameLine() {
                   modeName(s.mode), brg, s.yawTargetDeg, s.yawDeg, s.imuGood ? "" : "!", tof, vis, s.boxRatio,
                   s.vL, s.vR, s.tgtL, s.tgtR, s.pwmL, s.pwmR, (long)s.encL, (long)s.encR,
                   s.ctlDtMaxMs, s.btnLevel, (unsigned long)s.btnPresses);
+    // Bản gọn cho BLE (~75 ký tự/frame): chế độ, góc, yaw, tof, vis, tốc độ đo/đích, pwm, chu kỳ điều khiển lớn nhất
+    BleLog::log("R %s b=%s y=%+.1f%s t=%s vis=%s v=%.0f/%.0f g=%.0f/%.0f p=%d/%d c=%.1f",
+                modeName(s.mode), brg, s.yawDeg, s.imuGood ? "" : "!", tof, vis,
+                s.vL, s.vR, s.tgtL, s.tgtR, s.pwmL, s.pwmR, s.ctlDtMaxMs);
 }
 
 }  // namespace Robot

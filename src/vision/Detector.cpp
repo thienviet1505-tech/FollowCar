@@ -93,80 +93,93 @@ void Detector::decode(const ModelInference& model, int origWidth, int origHeight
         float w  = out[2 * rowStride + j];
         float h  = out[3 * rowStride + j];
 
+        // Lượt 1: class điểm cao nhất của box + điểm cao nhất mỗi class (để log [Score]).
         int bestClass = -1;
-        float bestScore = 0.0f;
-
+        float bestScore = -1.0f;
         for (int c = 0; c < numClasses; c++) {
-            float s = out[(4 + c) * rowStride + j];
-
+            const float s = out[(4 + c) * rowStride + j];
             if (std::isnan(s)) {
                 hasNan = true;
                 continue;
             }
-
             if (s > g_classMax[c]) g_classMax[c] = s;
-
             if (s > bestScore) {
                 bestScore = s;
                 bestClass = c;
             }
         }
+        if (bestClass < 0 || bestScore < CONF_THRESHOLD) continue;
 
-        if (bestClass >= 0 && bestScore >= CONF_THRESHOLD) {
-            const int modelW = model.inputWidth();
-            const int modelH = model.inputHeight();
+        // Lượt 2: DETECT_MULTI_LABEL = true thì mọi class có điểm >= CONF_THRESHOLD đều thành ứng viên (NMS vẫn theo từng class);
+        // false thì chỉ class điểm cao nhất như bản gốc.
+        bool boxBad = false, boxReady = false;
+        Detection base;
 
-            // Tính lại đúng letterbox parameters giống preprocessFrame().
-            float scaleW = (float)modelW / (float)origWidth;
-            float scaleH = (float)modelH / (float)origHeight;
-            float scale = std::min(scaleW, scaleH);
+        for (int c = 0; c < numClasses && !boxBad; c++) {
+            if (!Cfg::DETECT_MULTI_LABEL && c != bestClass) continue;
+            const float s = out[(4 + c) * rowStride + j];
+            if (std::isnan(s) || s < CONF_THRESHOLD) continue;
 
-            int resizeW = (int)std::round(origWidth * scale);
-            int resizeH = (int)std::round(origHeight * scale);
+            if (!boxReady) {
+                const int modelW = model.inputWidth();
+                const int modelH = model.inputHeight();
 
-            float padXf = (modelW - resizeW) / 2.0f;
-            float padYf = (modelH - resizeH) / 2.0f;
+                // Tính lại đúng letterbox parameters giống preprocessFrame().
+                float scaleW = (float)modelW / (float)origWidth;
+                float scaleH = (float)modelH / (float)origHeight;
+                float scale = std::min(scaleW, scaleH);
 
-            int padX = (int)std::round(padXf - 0.1f);
-            int padY = (int)std::round(padYf - 0.1f);
+                int resizeW = (int)std::round(origWidth * scale);
+                int resizeH = (int)std::round(origHeight * scale);
 
-            // Output model đã normalize theo kích thước input: x, w chia cho modelW; y, h chia cho modelH.
-            float cxModel = cx * modelW;
-            float cyModel = cy * modelH;
-            float wModel = w * modelW;
-            float hModel = h * modelH;
+                float padXf = (modelW - resizeW) / 2.0f;
+                float padYf = (modelH - resizeH) / 2.0f;
 
-            // xyxy trên ảnh letterbox.
-            float x1 = cxModel - wModel * 0.5f;
-            float y1 = cyModel - hModel * 0.5f;
-            float x2 = cxModel + wModel * 0.5f;
-            float y2 = cyModel + hModel * 0.5f;
+                int padX = (int)std::round(padXf - 0.1f);
+                int padY = (int)std::round(padYf - 0.1f);
 
-            // Bỏ phần padding và đưa về ảnh camera.
-            x1 = (x1 - padX) / scale;
-            y1 = (y1 - padY) / scale;
-            x2 = (x2 - padX) / scale;
-            y2 = (y2 - padY) / scale;
+                // Output model đã normalize theo kích thước input: x, w chia cho modelW; y, h chia cho modelH.
+                float cxModel = cx * modelW;
+                float cyModel = cy * modelH;
+                float wModel = w * modelW;
+                float hModel = h * modelH;
 
-            // Giới hạn box trong ảnh gốc.
-            x1 = std::max(0.0f, std::min(x1, (float)origWidth));
-            y1 = std::max(0.0f, std::min(y1, (float)origHeight));
-            x2 = std::max(0.0f, std::min(x2, (float)origWidth));
-            y2 = std::max(0.0f, std::min(y2, (float)origHeight));
+                // xyxy trên ảnh letterbox.
+                float x1 = cxModel - wModel * 0.5f;
+                float y1 = cyModel - hModel * 0.5f;
+                float x2 = cxModel + wModel * 0.5f;
+                float y2 = cyModel + hModel * 0.5f;
 
-            float boxW = x2 - x1;
-            float boxH = y2 - y1;
+                // Bỏ phần padding và đưa về ảnh camera.
+                x1 = (x1 - padX) / scale;
+                y1 = (y1 - padY) / scale;
+                x2 = (x2 - padX) / scale;
+                y2 = (y2 - padY) / scale;
 
-            if (boxW <= 0.0f || boxH <= 0.0f) continue;
+                // Giới hạn box trong ảnh gốc.
+                x1 = std::max(0.0f, std::min(x1, (float)origWidth));
+                y1 = std::max(0.0f, std::min(y1, (float)origHeight));
+                x2 = std::max(0.0f, std::min(x2, (float)origWidth));
+                y2 = std::max(0.0f, std::min(y2, (float)origHeight));
 
-            Detection d;
-            d.class_id = bestClass;
-            d.score = bestScore;
-            d.cx = (int)std::round((x1 + x2) * 0.5f);
-            d.cy = (int)std::round((y1 + y2) * 0.5f);
-            d.w = (int)std::round(boxW);
-            d.h = (int)std::round(boxH);
+                float boxW = x2 - x1;
+                float boxH = y2 - y1;
 
+                if (boxW <= 0.0f || boxH <= 0.0f) {
+                    boxBad = true;
+                    continue;
+                }
+
+                base.cx = (int)std::round((x1 + x2) * 0.5f);
+                base.cy = (int)std::round((y1 + y2) * 0.5f);
+                base.w = (int)std::round(boxW);
+                base.h = (int)std::round(boxH);
+                boxReady = true;
+            }
+
+            Detection d = base;
+            d.class_id = c;
+            d.score = s;
             candidates.push_back(d);
         }
     }

@@ -6,7 +6,7 @@ using namespace Cfg;
 
 namespace {
 
-void driveOne(int pwm, int sign, int in1, int in2, int ch) {
+void driveOne(int pwm, int sign, int in1, int in2, int ch, bool brakeAtZero) {
     const int v = constrain(pwm * sign, -PWM_MAX, PWM_MAX);
     if (v > 0) {
         digitalWrite(in1, HIGH);
@@ -17,9 +17,9 @@ void driveOne(int pwm, int sign, int in1, int in2, int ch) {
         digitalWrite(in2, HIGH);
         ledcWrite(ch, -v);
     } else {
-        // Phanh ngắn mạch (Short brake) trên TB6612 để xe dừng dứt khoát
-        digitalWrite(in1, HIGH);
-        digitalWrite(in2, HIGH);
+        // Phanh ngắn mạch (Short brake) trên TB6612 để xe dừng dứt khoát; brakeAtZero = false thì để bánh trôi
+        digitalWrite(in1, brakeAtZero ? HIGH : LOW);
+        digitalWrite(in2, brakeAtZero ? HIGH : LOW);
         ledcWrite(ch, 0);
     }
 }
@@ -44,10 +44,10 @@ void begin() {
     coast();
 }
 
-void setPwm(int pwmL, int pwmR) {
+void setPwm(int pwmL, int pwmR, bool brakeAtZero) {
     digitalWrite(STBY, HIGH);
-    driveOne(pwmL, MOTOR_SIGN_L, AIN1, AIN2, LEDC_CH_L);
-    driveOne(pwmR, MOTOR_SIGN_R, BIN1, BIN2, LEDC_CH_R);
+    driveOne(pwmL, MOTOR_SIGN_L, AIN1, AIN2, LEDC_CH_L, brakeAtZero);
+    driveOne(pwmR, MOTOR_SIGN_R, BIN1, BIN2, LEDC_CH_R, brakeAtZero);
 }
 
 void coast() {

@@ -4,10 +4,13 @@
 #include <algorithm>
 #include <esp_timer.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include "CameraModule.h"
 #include "ModelInference.h"
 #include "Detector.h"
+#include "TargetSelect.h"
 #include "SerialLogger.h"
+#include "BleLog.h"
 #include "ViewMode.h"
 #include "Robot.h"
 #include "RobotConfig.h"
@@ -30,7 +33,9 @@ struct Avg5 {
 Avg5 avgTotal, avgAge, avgLoop;
 uint32_t frameId = 0;
 int64_t prevFrameStartUs = 0;
-bool s_holdingTarget = false;   // trạng thái giữ mục tiêu cho ngưỡng kép (Hysteresis)
+TargetSelector s_selector;      // chọn mục tiêu: ngưỡng kép (Hysteresis), cổng (gate), làm mượt điểm (xem TargetSelect.h)
+int s_bootReason = 0;
+const char* s_bootReasonName = "";
 
 const char* className(int id) {
     static const char* const kNames[] = {"100k", "10k", "50k", "5k"};
@@ -195,6 +200,13 @@ void setup() {
     SerialLogger::begin(115200);
     delay(500);
     Serial.println("[Boot] start");
+    {
+        const esp_reset_reason_t rr = esp_reset_reason();   // BROWNOUT = tụt nguồn; PANIC/WDT = treo chương trình
+        s_bootReason = (int)rr;
+        s_bootReasonName = rr == ESP_RST_BROWNOUT ? " (BROWNOUT)" : (rr == ESP_RST_PANIC ? " (PANIC)" :
+                           (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT) ? " (WDT)" : "");
+        Serial.printf("[Boot] reset reason=%d%s\n", s_bootReason, s_bootReasonName);
+    }
 
     if (!camera.begin()) {
         Serial.println("[Boot] camera init FAIL");
@@ -214,6 +226,10 @@ void setup() {
     Serial.printf("[Boot] internal free=%u largest=%u\n",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+
+    // Để CUỐI CÙNG: camera/model lấy bộ nhớ trước, BLE (nếu đang bật) lấy phần còn lại. Mặc định TẮT (không tốn SRAM).
+    BleLog::begin();
+    BleLog::log("[Boot] reset reason=%d%s", s_bootReason, s_bootReasonName);
 }
 
 void loop() {
@@ -227,7 +243,7 @@ void loop() {
     }
     if (ViewMode::active()) {
         prevFrameStartUs = 0;
-        s_holdingTarget = false;
+        s_selector.reset();
         static uint32_t lastViewPrintMs = 0;
         if (millis() - lastViewPrintMs >= 1000) {
             lastViewPrintMs = millis();
@@ -250,6 +266,7 @@ void loop() {
 
     if (!fb) {
         Serial.println("[Camera] capture FAIL");
+        BleLog::log("! camera capture FAIL");
         Robot::onDetection(false, 0.0f, 0.0f, tCap1);
         Robot::printFrameLine();
         delay(10);
@@ -282,6 +299,7 @@ void loop() {
 
     if (!infOk) {
         Serial.println("[NN] invoke FAIL");
+        BleLog::log("! NN invoke FAIL");
         Robot::onDetection(false, 0.0f, 0.0f, frameTimeUs);
         Robot::printFrameLine();
         return;
@@ -318,31 +336,18 @@ void loop() {
 
     printDetectionsLog(detections, origW, origH);
 
-    // ---- Chọn mục tiêu thuộc TARGET_CLASS với ngưỡng kép (Hysteresis) ----
-    const float minConf = s_holdingTarget ? Cfg::DETECT_HOLD_THRESH : Cfg::DETECT_ACQUIRE_THRESH;
-    const Detection* bestTarget = nullptr;
-    float bestArea = -1.0f;
-
-    for (const auto& d : detections) {
-        if (d.class_id == Cfg::TARGET_CLASS && d.score >= minConf) {
-            const float area = d.w * d.h;
-            if (area > bestArea) {
-                bestArea = area;
-                bestTarget = &d;
-            }
-        }
-    }
-
-    if (bestTarget) {
-        s_holdingTarget = true;
-        const float brg = RM::bearingDeg(bestTarget->cx, (float)origW);
-        const float maxSide = std::max(bestTarget->w, bestTarget->h);
-        const float boxRatio = (origW > 0) ? (maxSide / (float)origW) : 0.0f;
-        Robot::onDetection(true, brg, boxRatio, frameTimeUs);
+    // ---- Chọn mục tiêu thuộc TARGET_CLASS (ngưỡng kép, cổng, làm mượt điểm: xem TargetSelect.h) ----
+    const TargetSelector::Pick pick = s_selector.select(detections, origW, Robot::state().yawDeg);
+    if (pick.found) {
+        Robot::onDetection(true, pick.bearingDeg, pick.boxRatio, frameTimeUs);
     } else {
-        s_holdingTarget = false;
         Robot::onDetection(false, 0.0f, 0.0f, frameTimeUs);
     }
 
     Robot::printFrameLine();
+    if (BleLog::enabled()) {
+        BleLog::log("P fps=%.1f age=%.0f inf=%.0f sc=%.2f free=%u", fpsPipe, avgAge.get(), inferMs,
+                    (int)mx.size() > Cfg::TARGET_CLASS ? mx[Cfg::TARGET_CLASS] : 0.0f,
+                    (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    }
 }

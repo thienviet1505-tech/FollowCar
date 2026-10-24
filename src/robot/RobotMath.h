@@ -12,9 +12,14 @@ constexpr float RAD2DEG = 180.0f / PI_F;
 inline float clampf(float x, float lo, float hi) { return x < lo ? lo : (x > hi ? hi : x); }
 inline float sgnf(float x) { return x < 0.0f ? -1.0f : 1.0f; }
 
+// xung -> mm quãng đường bánh đi được
+inline float countsToMm(float counts) {
+    return counts / Cfg::COUNTS_PER_WHEEL_REV * PI_F * Cfg::WHEEL_DIAMETER_MM;
+}
+
 // xung/s -> mm/s
 inline float countsPerSecToMmPerSec(float cps) {
-    return cps / Cfg::COUNTS_PER_WHEEL_REV * PI_F * Cfg::WHEEL_DIAMETER_MM;
+    return countsToMm(cps);
 }
 
 // omega (do/s) -> vận tốc cộng thêm cho bánh phải (và trừ đi ở bánh trái). Quay trái (CCW) = dương.
@@ -55,37 +60,48 @@ inline float slew(float cur, float target, float maxDelta) {
     return target;
 }
 
-// Feed-forward: vận tốc (mm/s) -> PWM có dấu
+// Feed-forward: vận tốc (mm/s) -> PWM có dấu.
+// Liên tục quanh 0: dưới FF_KNEE_MM_S tăng tuyến tính từ 0 lên mức tại điểm gãy (bản cũ nhảy thẳng 0 -> PWM_DEADBAND,
+// nên khi đảo chiều PWM nhảy +DEADBAND -> -DEADBAND trong 1 chu kỳ).
 inline float feedForwardPwm(float vMmS) {
     const float a = fabsf(vMmS);
-    if (a < 1.0f) return 0.0f;
-    const float pwm = Cfg::PWM_DEADBAND +
-                      (Cfg::PWM_MAX - Cfg::PWM_DEADBAND) * a / Cfg::V_AT_PWM_MAX_MM_S;
+    const float atKnee = Cfg::PWM_DEADBAND +
+                         (Cfg::PWM_MAX - Cfg::PWM_DEADBAND) * Cfg::FF_KNEE_MM_S / Cfg::V_AT_PWM_MAX_MM_S;
+    const float pwm = (a < Cfg::FF_KNEE_MM_S)
+        ? atKnee * a / Cfg::FF_KNEE_MM_S
+        : Cfg::PWM_DEADBAND + (Cfg::PWM_MAX - Cfg::PWM_DEADBAND) * a / Cfg::V_AT_PWM_MAX_MM_S;
     return sgnf(vMmS) * pwm;
 }
 
 // PI vận tốc 1 bánh.
 struct WheelPid {
-    float target = 0, ramp = 0, integ = 0;
+    float target = 0, ramp = 0, integ = 0, pwmPrev = 0;
 
-    void reset() { target = ramp = integ = 0; }
+    void reset() { target = ramp = integ = pwmPrev = 0; }
 
     bool step(float vMeas, float dt, float& pwmOut) {
         ramp = slew(ramp, target, Cfg::ACCEL_MM_S2 * dt);
         if (target == 0.0f && ramp == 0.0f) {
             integ = 0;
+            pwmPrev = 0;
             pwmOut = 0;
             return true;
         }
         const float err = ramp - vMeas;
+        const float integOld = integ;
         integ = clampf(integ + Cfg::SPD_KI * err * dt, -Cfg::SPD_I_MAX, Cfg::SPD_I_MAX);
-        pwmOut = clampf(feedForwardPwm(ramp) + Cfg::SPD_KP * err + integ,
-                        -(float)Cfg::PWM_MAX, (float)Cfg::PWM_MAX);
+        const float cmd = clampf(feedForwardPwm(ramp) + Cfg::SPD_KP * err + integ,
+                                 -(float)Cfg::PWM_MAX, (float)Cfg::PWM_MAX);
+        // Giới hạn tốc độ đổi PWM (giảm dòng đỉnh / sụt áp). Đang bị giới hạn thì không tích thêm tích phân (chống windup).
+        pwmPrev = slew(pwmPrev, cmd, Cfg::PWM_SLEW_PER_S * dt);
+        if (pwmPrev != cmd) integ = integOld;
+        pwmOut = pwmPrev;
         return false;
     }
 };
 
 // Lịch sử yaw (vòng 64 mẫu = 0.64 s ở 100 Hz) để tra yaw tại thời điểm chụp ảnh (bù độ trễ nhận diện).
+// Cũng dùng lại cho quãng đường (mm) để bù độ trễ khoảng cách.
 struct YawHistory {
     static constexpr int N = 64;
     int64_t t[N] = {0};
@@ -123,7 +139,10 @@ struct FollowCmd {
     float w = 0;   // tốc độ quay (do/s), + = quay trái
 };
 
-inline FollowCmd followLaw(float yawErr, uint16_t tofMm, bool tofFresh, uint16_t visDistMm) {
+// holdDist: trạng thái "đã vào vùng dừng" giữ giữa các lần gọi (trễ kiểu Schmitt: dừng tại FOLLOW_DISTANCE_MM,
+// chỉ tiến lại khi xa hơn + FOLLOW_RESUME_MM). rateDps: tốc độ góc yaw hiện tại (gyro) để giảm chấn khi quay.
+inline FollowCmd followLaw(float yawErr, float rateDps, uint16_t tofMm, bool tofFresh, uint16_t visDistMm,
+                           bool& holdDist) {
     FollowCmd c;
     const float a = fabsf(yawErr);
     const bool tofValid = tofFresh && (tofMm < Cfg::TOF_NONE_MM);
@@ -144,17 +163,27 @@ inline FollowCmd followLaw(float yawErr, uint16_t tofMm, bool tofFresh, uint16_t
     if (a <= Cfg::ROTATE_ONLY_DEG) {
         if (hasDist) {
             const float e = (float)effDistMm - (float)Cfg::FOLLOW_DISTANCE_MM;
-            if (e > Cfg::FOLLOW_DEADBAND_MM) {
+            if (Cfg::FOLLOW_HOLD_HYSTERESIS) {
+                if (holdDist) {
+                    if (e > Cfg::FOLLOW_RESUME_MM) holdDist = false;   // tiền đã đi xa: bám lại
+                } else if (e <= 0.0f) {
+                    holdDist = true;                                    // tới đúng 15cm: dừng
+                }
+                if (!holdDist) {
+                    c.v = clampf(Cfg::KP_DIST * e, Cfg::V_FWD_MIN_MM_S, Cfg::V_FWD_MAX_MM_S);
+                } else if (Cfg::ALLOW_REVERSE_WHEN_CLOSE && e < -Cfg::FOLLOW_REVERSE_MM) {
+                    // Chỉ lùi nếu bật cờ ALLOW_REVERSE_WHEN_CLOSE
+                    c.v = clampf(Cfg::KP_DIST_BACK * (e + Cfg::FOLLOW_REVERSE_MM), -Cfg::V_BACK_MAX_MM_S, 0.0f);
+                } else {
+                    c.v = 0.0f;
+                }
+            } else if (e > Cfg::FOLLOW_DEADBAND_MM) {
                 // Còn xa hơn 15cm + deadband -> tiến lại gần
-                c.v = clampf(Cfg::KP_DIST * (e - Cfg::FOLLOW_DEADBAND_MM),
-                             0.0f, Cfg::V_FWD_MAX_MM_S);
+                c.v = clampf(Cfg::KP_DIST * (e - Cfg::FOLLOW_DEADBAND_MM), 0.0f, Cfg::V_FWD_MAX_MM_S);
             } else if (Cfg::ALLOW_REVERSE_WHEN_CLOSE && e < -Cfg::FOLLOW_DEADBAND_MM) {
-                // Chỉ lùi nếu bật cờ ALLOW_REVERSE_WHEN_CLOSE
-                c.v = clampf(Cfg::KP_DIST_BACK * (e + Cfg::FOLLOW_DEADBAND_MM),
-                             -Cfg::V_BACK_MAX_MM_S, 0.0f);
+                c.v = clampf(Cfg::KP_DIST_BACK * (e + Cfg::FOLLOW_DEADBAND_MM), -Cfg::V_BACK_MAX_MM_S, 0.0f);
             } else {
-                // Đã vào vùng dừng: dừng tiến!
-                c.v = 0.0f;
+                c.v = 0.0f;   // đã vào vùng dừng
             }
         } else {
             // Trường hợp hiếm khi không có cả ToF lẫn kích thước box: tiến thăm dò chậm
@@ -167,29 +196,33 @@ inline FollowCmd followLaw(float yawErr, uint16_t tofMm, bool tofFresh, uint16_t
         }
     }
 
-    // Tốc độ quay liên tục theo sai lệch hướng: bằng 0 tại HEAD_TOL_DEG rồi tăng dần (không có bước nhảy -> không giật)
+    // Tốc độ quay theo sai lệch hướng, trừ đi một phần tốc độ góc đang quay về phía đích (giảm chấn).
+    // Liên tục tại HEAD_TOL_DEG; trong vùng HEAD_TOL_DEG thì đứng yên.
     float w = 0.0f;
     if (a > Cfg::HEAD_TOL_DEG) {
-        w = sgnf(yawErr) * clampf(Cfg::HEAD_KP * (a - Cfg::HEAD_TOL_DEG), 0.0f, Cfg::MAX_TURN_DPS);
+        const float s = sgnf(yawErr);
+        const float toward = s * rateDps;
+        w = s * clampf(Cfg::HEAD_KP * (a - Cfg::HEAD_TOL_DEG) - Cfg::HEAD_KD * toward, 0.0f, Cfg::MAX_TURN_DPS);
     }
     c.w = w;
     return c;
 }
 
-// (v, w) -> vận tốc đích 2 bánh
-static_assert(Cfg::SPEED_DIVISOR >= 1.0f, "SPEED_DIVISOR phai >= 1");
+// (v, w) -> vận tốc đích 2 bánh, nhân SPEED_SCALE (< 1 chậm đi, > 1 nhanh lên).
+static_assert(Cfg::SPEED_SCALE >= 0.25f && Cfg::SPEED_SCALE <= 2.0f, "SPEED_SCALE phai trong [0.25, 2.0]");
 inline void wheelTargets(const FollowCmd& c, float& vL, float& vR) {
     const float d = wheelSpeedForTurn(c.w);
-    vL = c.v - d;
-    vR = c.v + d;
+    vL = (c.v - d) * Cfg::SPEED_SCALE;
+    vR = (c.v + d) * Cfg::SPEED_SCALE;
+    // Trần vận tốc bánh = V_AT_PWM_MAX_MM_S (ứng với PWM_MAX), giữ nguyên tỉ lệ giữa 2 bánh để không đổi hướng đi.
+    // Khi chậm đi (SPEED_SCALE < 1) trần thu nhỏ theo cùng tỉ lệ (đúng như SPEED_DIVISOR trước đây); nhanh lên thì trần giữ nguyên.
+    const float limit = Cfg::V_AT_PWM_MAX_MM_S * fminf(1.0f, Cfg::SPEED_SCALE);
     const float m = fmaxf(fabsf(vL), fabsf(vR));
-    if (m > Cfg::V_AT_PWM_MAX_MM_S) {
-        const float k = Cfg::V_AT_PWM_MAX_MM_S / m;
+    if (m > limit) {
+        const float k = limit / m;
         vL *= k;
         vR *= k;
     }
-    vL /= Cfg::SPEED_DIVISOR;   // giảm tốc độ để test (SPEED_DIVISOR = 1 -> không đổi)
-    vR /= Cfg::SPEED_DIVISOR;
 }
 
 }  // namespace RM

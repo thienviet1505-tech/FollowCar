@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <esp_heap_caps.h>
 #include "Robot.h"
+#include "BleLog.h"
 
 namespace {
 
@@ -21,6 +22,7 @@ void printHelp() {
     Serial.println("[Lenh] t = chay lai self-test voi anh mau to 100k");
     Serial.println("[Lenh] p = in thong so camera hien tai de dan vao CameraModule.cpp");
     Serial.println("[Lenh] m = in RAM con trong    ? = tro giup");
+    Serial.println("[Lenh] b = bat/tat log Bluetooth LE (tat thi giai phong SRAM; nho qua lan khoi dong; tu tam tat khi o VIEW)");
     Serial.println("[Nut ] G0 (BOOT) = doi qua lai giua v va d (xe tu dung khi vao che do xem anh)");
 }
 
@@ -82,12 +84,17 @@ void stopView(CameraModule& camera) {
 // Vào/ra chế độ xem ảnh: xe phải dừng trước khi bật WiFi, và chỉ được chạy lại sau khi về DETECT.
 void enterView() {
     Robot::setEnabled(false);
+    BleLog::pause();                           // nhường SRAM cho WiFi
     startView();
-    if (!s_active) Robot::setEnabled(true);   // bật WiFi thất bại -> ở lại DETECT
+    if (!s_active) {                           // bật WiFi thất bại -> ở lại DETECT
+        Robot::setEnabled(true);
+        BleLog::resume();
+    }
 }
 
 void leaveView(CameraModule& camera) {
     stopView(camera);
+    BleLog::resume();
     Robot::setEnabled(true);
 }
 
@@ -124,6 +131,10 @@ void handleSerial(CameraModule& camera) {
                 break;
             case 'm': case 'M':
                 printMem("hien tai");
+                break;
+            case 'b': case 'B':
+                BleLog::toggle();
+                printMem("sau khi doi BLE");
                 break;
             case '?': case 'h': case 'H':
                 printHelp();
