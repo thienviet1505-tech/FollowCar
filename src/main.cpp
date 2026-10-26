@@ -36,6 +36,10 @@ int64_t prevFrameStartUs = 0;
 TargetSelector s_selector;      // chọn mục tiêu: ngưỡng kép (Hysteresis), cổng (gate), làm mượt điểm (xem TargetSelect.h)
 int s_bootReason = 0;
 const char* s_bootReasonName = "";
+int s_camFails = 0;                          // số lần capture lỗi liên tiếp
+bool s_camRebooted = false;                  // lần boot này là do xe tự khởi động lại vì camera kẹt
+constexpr uint32_t kCamRebootMagic = 0xCA3E5A11u;
+RTC_NOINIT_ATTR uint32_t s_rebootWhy;        // sống sót qua esp_restart(); rác sau khi cấp nguồn lại nên chỉ tin khi lý do reset = SW
 
 const char* className(int id) {
     static const char* const kNames[] = {"100k", "10k", "50k", "5k"};
@@ -194,6 +198,19 @@ void runSelfTest(ModelInference& model) {
                   (unsigned long)invokeMs, score100k, detected ? "PASS" : "FAIL");
     Serial.println("============================================");
 }
+
+// Một dòng tóm tắt cờ build + giờ build: sau mỗi lần đổi cờ và nạp lại, nhìn dòng này (Serial/BLE) là biết xe đang chạy bản nào.
+const char* flagsLine() {
+    static char buf[200];
+    snprintf(buf, sizeof buf,
+             "[Cfg] %s %s SPD=%.2f BLE=%d VIEW=%d SLEW=%d FF0=%d IMU=%d TOF=%d CAM=%d MED=%d FUSE=%d STOP=%d BTN=%d ZUPT=%d GRACE=%d SLOG=%d TEST=%d",
+             __DATE__, __TIME__, Cfg::SPEED_SCALE, ROBOT_BLE_LOG, ROBOT_VIEW_MODE,
+             (int)Cfg::PWM_SLEW_LIMIT, (int)Cfg::FF_SMOOTH_ZERO, (int)Cfg::IMU_WATCHDOG, (int)Cfg::TOF_WATCHDOG,
+             (int)Cfg::CAMERA_WATCHDOG, (int)Cfg::TOF_MEDIAN_FILTER, (int)Cfg::TOF_FUSE_DISTANCE, (int)Cfg::TOF_SAFETY_STOP, (int)Cfg::BUTTON_ENABLE,
+             (int)Cfg::GYRO_ZUPT, (int)Cfg::REACQUIRE_GRACE, (int)Cfg::SERIAL_FRAME_LOG, (int)Cfg::BOOT_SELFTEST);
+    return buf;
+}
+
 }  // namespace
 
 void setup() {
@@ -203,10 +220,15 @@ void setup() {
     {
         const esp_reset_reason_t rr = esp_reset_reason();   // BROWNOUT = tụt nguồn; PANIC/WDT = treo chương trình
         s_bootReason = (int)rr;
+        s_camRebooted = (rr == ESP_RST_SW && s_rebootWhy == kCamRebootMagic);
+        s_rebootWhy = 0;
+        if (s_camRebooted) Serial.println("[Boot] Lan truoc xe TU KHOI DONG LAI vi camera loi lien tiep");
         s_bootReasonName = rr == ESP_RST_BROWNOUT ? " (BROWNOUT)" : (rr == ESP_RST_PANIC ? " (PANIC)" :
                            (rr == ESP_RST_TASK_WDT || rr == ESP_RST_INT_WDT || rr == ESP_RST_WDT) ? " (WDT)" : "");
         Serial.printf("[Boot] reset reason=%d%s\n", s_bootReason, s_bootReasonName);
     }
+    Serial.println(flagsLine());
+    if (!Cfg::TOF_SAFETY_STOP) Serial.println("[Cfg] CANH BAO: TOF_SAFETY_STOP = false -> xe KHONG tu khoa chieu tien khi ToF thay vat can");
 
     if (!camera.begin()) {
         Serial.println("[Boot] camera init FAIL");
@@ -218,7 +240,8 @@ void setup() {
         while (true) delay(1000);
     }
 
-    runSelfTest(model);
+    if (Cfg::BOOT_SELFTEST) runSelfTest(model);
+    else Serial.println("[Boot] bo qua self-test (BOOT_SELFTEST = false)");
     camera.discardFrames(3);
     Robot::begin();
     Serial.println("[Boot] detect ready");
@@ -227,9 +250,12 @@ void setup() {
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
-    // Để CUỐI CÙNG: camera/model lấy bộ nhớ trước, BLE (nếu đang bật) lấy phần còn lại. Mặc định TẮT (không tốn SRAM).
+    // Để CUỐI CÙNG: camera/model lấy bộ nhớ trước, BLE (nếu ROBOT_BLE_LOG = 1) lấy phần còn lại và bắt đầu phát.
     BleLog::begin();
     BleLog::log("[Boot] reset reason=%d%s", s_bootReason, s_bootReasonName);
+    if (s_camRebooted) BleLog::log("[Boot] lan truoc xe tu khoi dong lai vi camera loi lien tiep");
+    BleLog::log("%s", flagsLine());
+    if (!Cfg::TOF_SAFETY_STOP) BleLog::log("[Cfg] CANH BAO: TOF_SAFETY_STOP = false");
 }
 
 void loop() {
@@ -257,7 +283,7 @@ void loop() {
     const int64_t tFrame0 = esp_timer_get_time();
     if (prevFrameStartUs) avgLoop.add((tFrame0 - prevFrameStartUs) / 1000.0f);
     prevFrameStartUs = tFrame0;
-    Serial.printf("==== Frame %lu ====\n", (unsigned long)currentFrame);
+    if (Cfg::SERIAL_FRAME_LOG) Serial.printf("==== Frame %lu ====\n", (unsigned long)currentFrame);
 
     const int64_t tLoop0 = esp_timer_get_time();
     const int64_t tCap0 = esp_timer_get_time();
@@ -266,12 +292,22 @@ void loop() {
 
     if (!fb) {
         Serial.println("[Camera] capture FAIL");
-        BleLog::log("! camera capture FAIL");
+        BleLog::log("! camera capture FAIL (%d)", s_camFails + 1);
+        // Camera kẹt (nhiễu/sụt áp làm mất đồng bộ): mỗi lần esp_camera_fb_get chờ hàng giây rồi trả null, xe không có nhận diện mới
+        // nên đứng yên. Không có cách hồi phục nhẹ -> khởi động lại; lý do được ghi lại ở lần boot sau.
+        if (Cfg::CAMERA_WATCHDOG && ++s_camFails >= Cfg::CAMERA_FAIL_REBOOT_COUNT) {
+            Serial.println("[Camera] loi lien tiep -> khoi dong lai");
+            BleLog::log("! camera loi lien tiep -> khoi dong lai");
+            s_rebootWhy = kCamRebootMagic;
+            delay(400);   // cho BLE kịp gửi dòng cuối
+            ESP.restart();
+        }
         Robot::onDetection(false, 0.0f, 0.0f, tCap1);
         Robot::printFrameLine();
         delay(10);
         return;
     }
+    s_camFails = 0;
 
     const int origW = fb->width;
     const int origH = fb->height;
@@ -325,16 +361,18 @@ void loop() {
     const float loopMs  = avgLoop.get();
     const float fpsLoop = (loopMs > 0.0f) ? (1000.0f / loopMs) : 0.0f;
 
-    Serial.printf("[Perf] cap=%.0fms pre=%.0fms infer=%.0fms dec=%.0fms | total=%.0fms avg5=%.0fms FPS_pipe=%.2f age=%.0fms | FPS_loop=%.2f\n",
-                  capMs, preMs, inferMs, decMs, totalMs, avg5Ms, fpsPipe, avgAge.get(), fpsLoop);
+    if (Cfg::SERIAL_FRAME_LOG) {
+        Serial.printf("[Perf] cap=%.0fms pre=%.0fms infer=%.0fms dec=%.0fms | total=%.0fms avg5=%.0fms FPS_pipe=%.2f age=%.0fms | FPS_loop=%.2f\n",
+                      capMs, preMs, inferMs, decMs, totalMs, avg5Ms, fpsPipe, avgAge.get(), fpsLoop);
+    }
 
     const std::vector<float>& mx = Detector::classMaxScores();
-    if (mx.size() >= 4) {
+    if (Cfg::SERIAL_FRAME_LOG && mx.size() >= 4) {
         Serial.printf("[Score] max: 100k=%.3f 10k=%.3f 50k=%.3f 5k=%.3f\n",
                       mx[0], mx[1], mx[2], mx[3]);
     }
 
-    printDetectionsLog(detections, origW, origH);
+    if (Cfg::SERIAL_FRAME_LOG) printDetectionsLog(detections, origW, origH);
 
     // ---- Chọn mục tiêu thuộc TARGET_CLASS (ngưỡng kép, cổng, làm mượt điểm: xem TargetSelect.h) ----
     const TargetSelector::Pick pick = s_selector.select(detections, origW, Robot::state().yawDeg);

@@ -3,13 +3,10 @@
 #if ROBOT_BLE_LOG
 
 #include <Arduino.h>
-#include <Preferences.h>
 #include <NimBLEDevice.h>
 #include <esp_heap_caps.h>
 #include <stdarg.h>
 #include <stdio.h>
-#include <string.h>
-#include <strings.h>
 #include "LogRing.h"
 
 namespace {
@@ -17,7 +14,7 @@ namespace {
 constexpr const char* kDeviceName = "FollowRobot";
 // Nordic UART Service: các app BLE UART (Serial Bluetooth Terminal, nRF Toolbox...) nhận ra ngay.
 constexpr const char* kUuidService = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-constexpr const char* kUuidRx = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";   // điện thoại -> xe (lệnh)
+constexpr const char* kUuidRx = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";   // điện thoại -> xe (app cần có, xe bỏ qua dữ liệu)
 constexpr const char* kUuidTx = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";   // xe -> điện thoại (notify)
 
 constexpr size_t kRingBytes = 4096;        // bộ đệm log (ưu tiên đặt trong PSRAM)
@@ -32,12 +29,10 @@ constexpr int kTaskStack = 4096;
 enum class St : uint8_t { OFF, RUNNING };
 
 volatile St s_state = St::OFF;
-volatile bool s_reqStop = false;           // yêu cầu task gửi tự dọn dẹp rồi thoát
-volatile bool s_reqPersistOff = false;     // lệnh "off" từ BLE: lưu cờ tắt sau khi dọn xong
+volatile bool s_reqStop = false;           // yêu cầu task gửi tự dọn dẹp rồi thoát (chỉ dùng khi pause())
 volatile bool s_connected = false;
 volatile uint16_t s_mtu = 23;
-bool s_wantOn = false;                     // ý muốn của người dùng (lưu NVS)
-bool s_paused = false;                     // đang ở chế độ VIEW (WiFi)
+bool s_started = false;                    // begin() đã được gọi -> resume() mới bật lại
 
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 LogRing s_ring;
@@ -46,48 +41,15 @@ TaskHandle_t s_task = nullptr;
 NimBLEServer* s_server = nullptr;
 NimBLECharacteristic* s_tx = nullptr;
 
-// ---------------- cờ lưu trong NVS ----------------
-bool loadFlag(const char* key) {
-    Preferences p;
-    bool v = false;
-    if (p.begin("robot", false)) { v = p.getBool(key, false); p.end(); }   // mở đọc-ghi để lần đầu không báo lỗi NOT_FOUND
-    return v;
-}
-void saveFlag(const char* key, bool v) {
-    Preferences p;
-    if (p.begin("robot", false)) { p.putBool(key, v); p.end(); }
-}
-
 size_t freeInternal() { return heap_caps_get_free_size(MALLOC_CAP_INTERNAL); }
 
-// ---------------- callback ----------------
-// Cố ý KHÔNG dùng 'override': nếu bản thư viện có chữ ký khác thì chỉ mất phần tối ưu (MTU nhỏ / không nhận lệnh),
-// không gây lỗi biên dịch. platformio.ini ghim NimBLE-Arduino 1.4.x, chữ ký dưới đây đúng với bản đó.
+// Cố ý KHÔNG dùng 'override': nếu bản thư viện có chữ ký khác thì chỉ mất phần tối ưu (MTU nhỏ), không lỗi biên dịch.
+// platformio.ini ghim NimBLE-Arduino 1.4.x, chữ ký dưới đây đúng với bản đó.
 class ServerCb : public NimBLEServerCallbacks {
 public:
     void onMTUChange(uint16_t mtu, ble_gap_conn_desc*) { s_mtu = mtu; }
 };
-
-class RxCb : public NimBLECharacteristicCallbacks {
-public:
-    void onWrite(NimBLECharacteristic* c) {
-        auto v = c->getValue();
-        const char* p = v.c_str();
-        size_t n = v.size();
-        while (n > 0 && (*p == ' ' || *p == '\r' || *p == '\n')) { p++; n--; }
-        if (n >= 3 && strncasecmp(p, "off", 3) == 0) {
-            // Không dọn dẹp ngay trong callback của NimBLE (sẽ tự khóa): chỉ đặt cờ, task gửi sẽ làm.
-            s_wantOn = false;
-            s_reqPersistOff = true;
-            s_reqStop = true;
-        } else {
-            BleLog::log("[BLE] lenh: off = tat BLE+log (luu), ? = tro giup. Bat lai: go 'b' o Serial USB");
-        }
-    }
-};
-
 ServerCb s_serverCb;
-RxCb s_rxCb;
 
 // Dọn mọi thứ (chạy trong task gửi, hoặc khi khởi động thất bại). Sau hàm này không còn gì chiếm SRAM.
 void teardown() {
@@ -115,7 +77,7 @@ void senderTask(void*) {
         if (nconn == 0) {
             if (wasConn) { wasConn = false; s_connected = false; s_mtu = 23; }
             NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
-            if (adv && !adv->isAdvertising()) adv->start();   // sau khi ngắt kết nối phải quảng bá lại
+            if (adv && !adv->isAdvertising()) adv->start();   // chưa có ai kết nối / vừa bị ngắt: phải quảng bá (lại)
             vTaskDelay(pdMS_TO_TICKS(250));
             continue;
         }
@@ -149,7 +111,6 @@ void senderTask(void*) {
 
     const size_t before = freeInternal();
     teardown();
-    if (s_reqPersistOff) { saveFlag("ble_log", false); s_reqPersistOff = false; }
     Serial.printf("[BLE] TAT | SRAM noi con %u B (giai phong ~%d B)\n", (unsigned)freeInternal(),
                   (int)(freeInternal() - before));
     s_task = nullptr;
@@ -182,16 +143,14 @@ bool startRunning() {
     s_server->setCallbacks(&s_serverCb);
     NimBLEService* svc = s_server->createService(kUuidService);
     s_tx = svc->createCharacteristic(kUuidTx, NIMBLE_PROPERTY::NOTIFY);
-    NimBLECharacteristic* rx = svc->createCharacteristic(kUuidRx, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
-    rx->setCallbacks(&s_rxCb);
+    svc->createCharacteristic(kUuidRx, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
     svc->start();
 
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->addServiceUUID(kUuidService);
-    adv->start();
+    adv->start();   // phát ngay: điện thoại quét thấy "FollowRobot" là kết nối được
 
     s_reqStop = false;
-    s_reqPersistOff = false;
     s_connected = false;
     s_mtu = 23;
     s_state = St::RUNNING;   // phải đặt trước khi tạo task để log() nhận dòng
@@ -205,7 +164,7 @@ bool startRunning() {
     }
 
     BleLog::log("[BLE] san sang. SRAM noi con %u", (unsigned)freeInternal());
-    Serial.printf("[BLE] BAT | tim '%s' trong app BLE UART | SRAM noi con %u B (BLE chiem ~%d B, chua tinh luc dang ket noi)\n",
+    Serial.printf("[BLE] BAT | dang phat '%s' | SRAM noi con %u B (BLE chiem ~%d B, chua tinh luc dang ket noi)\n",
                   kDeviceName, (unsigned)freeInternal(), (int)(before - freeInternal()));
     return true;
 }
@@ -222,53 +181,16 @@ void stopRunning() {
 namespace BleLog {
 
 void begin() {
-    // Bảo vệ vòng lặp khởi động: nếu lần trước đang khởi tạo BLE mà xe reset (hết RAM, panic...) thì tự tắt cờ.
-    if (loadFlag("ble_try")) {
-        Serial.println("[BLE] Lan khoi dong truoc bi loi luc bat BLE -> tu tat log BLE (go 'b' de thu bat lai)");
-        saveFlag("ble_try", false);
-        saveFlag("ble_log", false);
-    }
-    s_wantOn = loadFlag("ble_log");
-    if (!s_wantOn) {
-        Serial.println("[BLE] log Bluetooth dang TAT (khong ton SRAM). Go 'b' qua Serial USB de bat.");
-        return;
-    }
-    saveFlag("ble_try", true);
+    s_started = true;
     startRunning();
-    saveFlag("ble_try", false);
-}
-
-bool setEnabled(bool on, bool persist) {
-    s_wantOn = on;
-    if (persist) saveFlag("ble_log", on);
-    if (on) {
-        if (s_paused) {
-            Serial.println("[BLE] Se bat khi thoat che do VIEW");
-            return true;
-        }
-        return startRunning();
-    }
-    stopRunning();
-    return false;
-}
-
-bool toggle() {
-    setEnabled(!s_wantOn, true);
-    return s_wantOn;
 }
 
 bool enabled() { return s_state == St::RUNNING; }
 bool connected() { return s_connected; }
 
-void pause() {
-    s_paused = true;
-    stopRunning();   // WiFi (VIEW) cần SRAM nội; không đổi cờ s_wantOn / NVS
-}
+void pause() { stopRunning(); }   // WiFi (VIEW) cần SRAM nội
 
-void resume() {
-    s_paused = false;
-    if (s_wantOn) startRunning();
-}
+void resume() { if (s_started) startRunning(); }
 
 void log(const char* fmt, ...) {
     if (s_state != St::RUNNING) return;   // tắt thì không format, không khóa: chi phí bằng 0

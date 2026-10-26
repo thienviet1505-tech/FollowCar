@@ -93,7 +93,8 @@ void imuReinit() {
 
 // VL53L0X mất nguồn sẽ quên chế độ đo liên tục: khởi tạo lại y như lúc boot (mất ~100 ms nên chỉ gọi khi xe đứng yên).
 void tofReinit() {
-    if (tof.begin(VL53L0X_I2C_ADDR, false, &Wire)) tof.startRangeContinuous(TOF_PERIOD_MS);
+    s_tofOk = tof.begin(VL53L0X_I2C_ADDR, false, &Wire);
+    if (s_tofOk) tof.startRangeContinuous(TOF_PERIOD_MS);
     s_tofMm = TOF_NONE_MM;
     s_tofHistN = 0;
     s_tofStampMs = millis();
@@ -166,6 +167,7 @@ bool calibrateGyro() {
     if (range > GYRO_CAL_MAX_RANGE_DPS || am < 7.0f || am > 12.5f) {
         Serial.printf("[Gyro] HIEU CHINH THAT BAI: robot dang rung/di chuyen? (dao dong=%.1f do/s, |a|=%.1f m/s2).\n",
                       range, am);
+        BleLog::log("GYRO calib that bai: dao dong=%.1f |a|=%.1f (giu xe dung yen)", range, am);
         return false;
     }
     for (int k = 0; k < 3; k++) {
@@ -178,6 +180,7 @@ bool calibrateGyro() {
     s_stationaryTicks = 0;
     Serial.printf("[Gyro] bias=(%.2f,%.2f,%.2f) do/s | up=(%.2f,%.2f,%.2f) | dao dong=%.2f do/s\n",
                   s_bias[0], s_bias[1], s_bias[2], s_up[0], s_up[1], s_up[2], range);
+    BleLog::log("GYRO calib OK bias=%.2f,%.2f,%.2f", s_bias[0], s_bias[1], s_bias[2]);
     return true;
 }
 
@@ -205,7 +208,7 @@ void update(float dt, Reading& out) {
             s_prevSample[k] = cur[k];
         }
         s_frozenTicks = same ? s_frozenTicks + 1 : 0;
-        const bool frozen = s_frozenTicks >= IMU_FROZEN_TICKS;
+        const bool frozen = IMU_WATCHDOG && s_frozenTicks >= IMU_FROZEN_TICKS;
 
         const float am = sqrtf(a.acceleration.x * a.acceleration.x + a.acceleration.y * a.acceleration.y +
                                a.acceleration.z * a.acceleration.z);
@@ -222,7 +225,7 @@ void update(float dt, Reading& out) {
 
             // ZUPT: Nếu 2 bánh đứng yên đủ lâu và tốc độ góc nhỏ (chỉ là nhiễu/trôi nhiệt),
             // khóa tích phân góc yaw và cập nhật mượt lại bias để triệt tiêu trôi góc.
-            if (s_stationaryTicks >= ZUPT_HOLD_TICKS && fabsf(rawRate) < ZUPT_MAX_RATE_DPS) {
+            if (GYRO_ZUPT && s_stationaryTicks >= ZUPT_HOLD_TICKS && fabsf(rawRate) < ZUPT_MAX_RATE_DPS) {
                 for (int k = 0; k < 3; k++) {
                     s_bias[k] += GYRO_BIAS_ADAPT_ALPHA * (rawG[k] - s_bias[k]);
                 }
@@ -234,10 +237,21 @@ void update(float dt, Reading& out) {
         }
     }
 
-    // Bộ canh IMU: xấu liên tục quá IMU_REINIT_MS thì khởi tạo lại (Robot đã tự dừng xe khi imuGood = false, và tự chạy lại khi tốt).
-    if (s_imuOk) {
+    // Bộ canh IMU. (1) Không thấy MPU6050 lúc boot (nguồn pin chưa ổn định / nhiễu I2C): thử lại định kỳ. Trước đây chỉ thử 1 lần
+    // lúc boot rồi xe đứng ở CALIB cho tới khi reset => "lúc đi lúc không" tùy lần bật nguồn.
+    // (2) Xấu liên tục quá IMU_REINIT_MS thì khởi tạo lại (Robot đã tự dừng xe khi imuGood = false, và tự chạy lại khi tốt).
+    if (IMU_WATCHDOG) {
         const uint32_t nowMs = millis();
-        if (s_imuGood) {
+        if (!s_imuOk) {
+            if (nowMs - s_lastImuReinitMs >= IMU_REINIT_RETRY_MS) {
+                s_lastImuReinitMs = nowMs;
+                i2cRecover();
+                s_imuOk = mpu.begin(0x68, &Wire);
+                if (s_imuOk) imuConfigure();
+                Serial.printf("[Sensors] Thu lai MPU6050: %s\n", s_imuOk ? "OK" : "van KHONG THAY");
+                BleLog::log("SENSOR thu lai MPU6050: %s", s_imuOk ? "OK" : "van khong thay");
+            }
+        } else if (s_imuGood) {
             s_imuBadSinceMs = 0;
         } else {
             if (s_imuBadSinceMs == 0) s_imuBadSinceMs = nowMs;
@@ -257,19 +271,19 @@ void update(float dt, Reading& out) {
             s_tofHist[s_tofHistIdx] = v;
             s_tofHistIdx = (s_tofHistIdx + 1) % 3;
             if (s_tofHistN < 3) s_tofHistN++;
-            s_tofMm = (s_tofHistN < 3) ? v : median3(s_tofHist[0], s_tofHist[1], s_tofHist[2]);
+            s_tofMm = (TOF_MEDIAN_FILTER && s_tofHistN >= 3) ? median3(s_tofHist[0], s_tofHist[1], s_tofHist[2]) : v;
             s_tofStampMs = millis();
         }
     }
 
-    // Bộ canh ToF: lâu không có mẫu mới (mất nguồn) và xe đang đứng yên thì khởi tạo lại.
-    if (s_tofOk && s_stationaryTicks >= ZUPT_HOLD_TICKS) {
+    // Bộ canh ToF: không thấy lúc boot, hoặc lâu không có mẫu mới (mất nguồn), và xe đang đứng yên thì khởi tạo lại.
+    if (TOF_WATCHDOG && s_stationaryTicks >= ZUPT_HOLD_TICKS) {
         const uint32_t nowMs = millis();
-        if (nowMs - s_tofStampMs > TOF_REINIT_MS && nowMs - s_lastTofReinitMs >= TOF_REINIT_RETRY_MS) {
+        if ((!s_tofOk || nowMs - s_tofStampMs > TOF_REINIT_MS) && nowMs - s_lastTofReinitMs >= TOF_REINIT_RETRY_MS) {
             s_lastTofReinitMs = nowMs;
-            Serial.println("[Sensors] ToF khong co mau moi -> khoi tao lai VL53L0X");
-            BleLog::log("SENSOR ToF khong co mau -> khoi tao lai");
             tofReinit();
+            Serial.printf("[Sensors] Khoi tao lai VL53L0X: %s\n", s_tofOk ? "OK" : "van KHONG THAY");
+            BleLog::log("SENSOR khoi tao lai ToF: %s", s_tofOk ? "OK" : "van khong thay");
         }
     }
 

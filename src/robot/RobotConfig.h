@@ -4,7 +4,49 @@
 // =============================================================================
 #include <stdint.h>
 
+// =============================================================================
+// CỜ BẬT/TẮT TÍNH NĂNG: đổi giá trị -> BUILD LẠI -> NẠP LẠI. Mặc định bật hết (= hành vi hiện tại).
+// Lúc boot xe in một dòng "[Cfg] ..." (Serial + BLE) tóm tắt cờ và giờ build để biết đang chạy bản nào.
+//   A. Macro (đổi cái được biên dịch/liên kết vào firmware) - ngay bên dưới.
+//   B. Cờ hành vi `constexpr bool` - đầu namespace Cfg, ngay sau macro.
+//   C. Các cờ cũ DETECT_* / DIST_DEAD_RECKON / FOLLOW_HOLD_HYSTERESIS / COAST_AT_ZERO / ALLOW_REVERSE_WHEN_CLOSE
+//      vẫn nằm ở mục BÁM THEO bên dưới.
+// =============================================================================
+
+// ---- A. Macro ----
+// Log Bluetooth LE (xem src/utils/BleLog.h). 1 = xe tự phát "FollowRobot" ngay khi boot để điện thoại kết nối xem log;
+// 0 = loại hẳn NimBLE khỏi firmware (không tốn flash/SRAM). Đây là công tắc DUY NHẤT của BLE (không còn lệnh bật/tắt lúc chạy).
+#define ROBOT_BLE_LOG 1
+// Chế độ xem ảnh qua WiFi (lệnh 'v' / nút G0). 0 = bỏ WiFi + web server + trang web khỏi firmware (giảm flash/SRAM),
+// đồng thời nút G0 không còn tác dụng.
+#define ROBOT_VIEW_MODE 1
+// Suy luận model (xem ModelInference.cpp). Chỉ đổi khi so sánh tốc độ.
+#define MODEL_IN_PSRAM 1            // 1 = model nằm trong PSRAM
+#define NN_DUAL_CORE 1              // 1 = ESP-NN chạy 2 lõi
+#define CONV_OPT_AUTOTUNE 1         // 1 = tự đo từng conv 3x3 lúc khởi động và chọn cách chạy nhanh nhất (0 = kernel ESP-NN gốc)
+#define PROFILE_OPS 0               // 1 = in bảng thời gian từng op sau mỗi lần invoke
+#define NN_SCRATCH_PREALLOC 65536   // byte scratch cấp sẵn cho ESP-NN dual-core (0 = tắt); conv 3x3 K=1152 cần 62.560 B
+
+static_assert((ROBOT_BLE_LOG == 0 || ROBOT_BLE_LOG == 1) && (ROBOT_VIEW_MODE == 0 || ROBOT_VIEW_MODE == 1),
+              "cac co macro chi nhan 0 hoac 1");
+
 namespace Cfg {
+
+// ---- B. Cờ hành vi (true = bật). false = quay về cách làm của bản gốc cho riêng tính năng đó ----
+constexpr bool PWM_SLEW_LIMIT = true;       // giới hạn tốc độ đổi PWM đầu ra (PWM_SLEW_PER_S) + chống windup tích phân
+constexpr bool FF_SMOOTH_ZERO = true;       // feed-forward tăng dần từ 0 (FF_KNEE_MM_S); false = nhảy 0 -> PWM_DEADBAND
+constexpr bool IMU_WATCHDOG = true;         // MPU6050 đóng băng/lỗi, hoặc KHÔNG THẤY lúc boot -> tự nhả bus I2C + khởi tạo lại (tắt: thiếu IMU lúc boot thì xe đứng cho tới khi reset)
+constexpr bool TOF_WATCHDOG = true;         // VL53L0X mất mẫu quá TOF_REINIT_MS hoặc không thấy lúc boot -> tự khởi tạo lại (chỉ khi xe đứng yên)
+constexpr bool CAMERA_WATCHDOG = true;      // camera capture lỗi liên tiếp CAMERA_FAIL_REBOOT_COUNT lần (camera kẹt do nhiễu/sụt áp) -> tự khởi động lại xe
+constexpr int CAMERA_FAIL_REBOOT_COUNT = 3;
+constexpr bool TOF_MEDIAN_FILTER = true;    // lọc trung vị 3 mẫu ToF (1 mẫu nhiễu không làm xe dừng/lùi); false = phản ứng nhanh hơn 50-100 ms
+constexpr bool TOF_FUSE_DISTANCE = true;    // khoảng cách bám = min(ToF, ước lượng từ box); false = ưu tiên camera, ToF chỉ dùng khi camera không có số
+constexpr bool TOF_SAFETY_STOP = true;      // ToF < TOF_STOP_MM thì khóa chiều tiến (BLOCKED). false = MẤT AN TOÀN, chỉ để thử nghiệm
+constexpr bool BUTTON_ENABLE = true;        // nút G0 (BOOT) đổi VIEW/DETECT. false = không đọc GPIO0 (loại nghi vấn nhiễu làm xe dừng). Cần ROBOT_VIEW_MODE = 1
+constexpr bool GYRO_ZUPT = true;            // khóa trôi gyro khi 2 bánh đứng yên (ZUPT_*)
+constexpr bool REACQUIRE_GRACE = true;      // sau khi buông mục tiêu, REACQUIRE_GRACE_FRAMES frame kế bắt lại bằng ngưỡng DETECT_HOLD_THRESH
+constexpr bool SERIAL_FRAME_LOG = true;     // in ~500 ký tự/frame ra Serial (tốn ~40 ms/frame ở 115200, kể cả khi không ai đọc). false = chỉ in sự kiện/lỗi; log BLE gọn vẫn chạy
+constexpr bool BOOT_SELFTEST = true;        // chạy self-test model lúc boot (lệnh 't' vẫn chạy thủ công được). false = boot nhanh hơn, nhưng mất bước làm nóng + kiểm tra model
 
 // ============================== TỐC ĐỘ =======================================
 // Nhân toàn bộ vận tốc đích 2 bánh (cả tiến lẫn quay) với hệ số này. Cho phép [0.25, 2.0].
@@ -12,7 +54,7 @@ namespace Cfg {
 // - Chậm đi (< 1): quá nhỏ (< ~0.25) thì vận tốc đích rơi xuống dưới PWM_DEADBAND, xe giật.
 // - Nhanh lên (> 1): vẫn bị chặn ở V_AT_PWM_MAX_MM_S (ứng với PWM_MAX). Luật bám/quay được tính TRƯỚC khi nhân hệ số nên độ lợi
 //   vòng điều khiển (KP_DIST, HEAD_KP) cũng tăng theo hệ số: nếu xe lắc khi quay hoặc khi dừng thì giảm hệ số hoặc HEAD_KP.
-constexpr float SPEED_SCALE = 1.4f;
+constexpr float SPEED_SCALE = 1.0f;
 
 // ============================== BÁM THEO =====================================
 constexpr int TARGET_CLASS = 2;                        // lớp tiền cần bám: 0=100k 1=10k 2=50k 3=5k
@@ -39,6 +81,7 @@ constexpr bool DETECT_SCORE_SMOOTH = true;      // (3a, cần DETECT_GATE) đi�
 constexpr bool DIST_DEAD_RECKON = true;         // khoảng cách giữa 2 frame = khoảng cách lúc chụp - quãng đường encoder (không chạy theo số cũ)
 constexpr bool FOLLOW_HOLD_HYSTERESIS = true;   // dừng đúng 15cm, trễ khi tiến lại; false = deadband +-FOLLOW_DEADBAND_MM như bản gốc
 constexpr bool COAST_AT_ZERO = true;            // PWM = 0 thì nhả trôi; false = phanh ngắn mạch như bản gốc
+static_assert(!DETECT_SCORE_SMOOTH || DETECT_GATE, "DETECT_SCORE_SMOOTH can DETECT_GATE = true");
 
 // Cổng (gate, chỉ khi DETECT_GATE): box lệch hướng không quá GATE_BEARING_DEG (đã bù góc xe quay giữa 2 frame)
 // và cạnh lớn nằm trong [GATE_SIZE_MIN, GATE_SIZE_MAX] x cạnh lớn lần trước thì được nhận ở DETECT_GATE_THRESH;

@@ -73,10 +73,12 @@ void controlTask(void*) {
     float winMax = 0, dtShown = 0;
     int winTicks = 0;
 
+    // Nút G0 chỉ có tác dụng khi bật BUTTON_ENABLE và còn chế độ VIEW (ROBOT_VIEW_MODE); tắt thì không đọc GPIO0.
+    constexpr bool kButton = BUTTON_ENABLE && (ROBOT_VIEW_MODE != 0);
     bool btnArmed = false, btnFired = false;
     uint32_t btnLowSince = 0;
-    pinMode(BUTTON_PIN, INPUT_PULLUP);
-    int btnRaw = digitalRead(BUTTON_PIN), btnRawPrev = btnRaw;
+    if (kButton) pinMode(BUTTON_PIN, INPUT_PULLUP);
+    int btnRaw = kButton ? digitalRead(BUTTON_PIN) : HIGH, btnRawPrev = btnRaw;
     uint32_t btnPresses = 0;
 
     Sensors::update(0.0f, rd);
@@ -140,28 +142,30 @@ void controlTask(void*) {
         }
 
         // ---- nút G0 ----
-        btnRaw = digitalRead(BUTTON_PIN);
-        const bool btnLow = (btnRaw == LOW);
-        if (btnRaw != btnRawPrev) {
-            Serial.println(btnLow ? "[Robot] G0 xuong" : "[Robot] G0 len");
-            BleLog::log("G0 %s", btnLow ? "xuong" : "len");
-            btnRawPrev = btnRaw;
-        }
-        if (!btnLow) {
-            btnArmed = true;
-            btnFired = false;
-            btnLowSince = 0;
-        } else if (btnArmed && !btnFired) {
-            if (btnLowSince == 0) btnLowSince = nowMs;
-            if (nowMs - btnLowSince >= (uint32_t)BUTTON_DEBOUNCE_MS) {
-                btnFired = true;
-                btnPresses++;
-                s_enabled = false;
-                portENTER_CRITICAL(&s_mux);
-                s_btnCount++;
-                portEXIT_CRITICAL(&s_mux);
-                Serial.println("[Robot] Nut G0 -> dung xe");
-                BleLog::log("G0 -> dung xe");
+        if (kButton) {
+            btnRaw = digitalRead(BUTTON_PIN);
+            const bool btnLow = (btnRaw == LOW);
+            if (btnRaw != btnRawPrev) {
+                Serial.println(btnLow ? "[Robot] G0 xuong" : "[Robot] G0 len");
+                BleLog::log("G0 %s", btnLow ? "xuong" : "len");
+                btnRawPrev = btnRaw;
+            }
+            if (!btnLow) {
+                btnArmed = true;
+                btnFired = false;
+                btnLowSince = 0;
+            } else if (btnArmed && !btnFired) {
+                if (btnLowSince == 0) btnLowSince = nowMs;
+                if (nowMs - btnLowSince >= (uint32_t)BUTTON_DEBOUNCE_MS) {
+                    btnFired = true;
+                    btnPresses++;
+                    s_enabled = false;
+                    portENTER_CRITICAL(&s_mux);
+                    s_btnCount++;
+                    portEXIT_CRITICAL(&s_mux);
+                    Serial.println("[Robot] Nut G0 -> dung xe");
+                    BleLog::log("G0 -> dung xe");
+                }
             }
         }
 
@@ -218,9 +222,14 @@ void controlTask(void*) {
 
         if (mode == Mode::CALIB) {
             if (!Sensors::imuPresent()) {
-                if (!warnedNoImu) { Serial.println("[Robot] KHONG CO IMU -> xe se khong chay"); warnedNoImu = true; }
+                if (!warnedNoImu) {
+                    Serial.println("[Robot] KHONG THAY IMU -> xe chua chay, Sensors se thu lai dinh ky");
+                    BleLog::log("KHONG THAY IMU -> xe chua chay, dang thu lai");
+                    warnedNoImu = true;
+                }
             } else if (nowMs >= nextCalibMs) {
                 Serial.println("[Robot] Hieu chinh gyro 1.5 s - giu xe DUNG YEN");
+                BleLog::log("CALIB gyro 1.5 s - giu xe dung yen");
                 if (Sensors::calibrateGyro()) {
                     hist.clear();
                     odoHist.clear();
@@ -254,7 +263,7 @@ void controlTask(void*) {
             } else if (nowMs - lastSeenMs > LOST_TIMEOUT_MS) {
                 seenStreak = 0;
                 setMode(Mode::LOST);
-            } else if (mode == Mode::TRACK && tofFresh && rd.tofMm < TOF_STOP_MM) {
+            } else if (mode == Mode::TRACK && TOF_SAFETY_STOP && tofFresh && rd.tofMm < TOF_STOP_MM) {
                 setMode(Mode::BLOCKED);
             } else if (mode == Mode::BLOCKED && (!tofFresh || rd.tofMm >= TOF_RESUME_MM)) {
                 setMode(Mode::TRACK);
@@ -365,6 +374,7 @@ State state() {
 }
 
 void printFrameLine() {
+    if (!SERIAL_FRAME_LOG && !BleLog::enabled()) return;   // không ai nhận thì khỏi định dạng chuỗi
     const State s = state();
     char tof[8], vis[8], brg[10];
     if (s.tofMm >= TOF_NONE_MM) snprintf(tof, sizeof tof, "--");
@@ -373,10 +383,12 @@ void printFrameLine() {
     else snprintf(vis, sizeof vis, "%u", (unsigned)s.visMm);
     if (s.seen) snprintf(brg, sizeof brg, "%+.1f", s.bearingDeg);
     else snprintf(brg, sizeof brg, "--");
-    Serial.printf("[Robot] %s brg=%s yawT=%+.1f yaw=%+.1f%s | tof=%s vis=%s ratio=%.2f | v=%.0f/%.0f tgt=%.0f/%.0f pwm=%d/%d | enc=%ld/%ld | ctl=%.1fms | btn=%d/%lu\n",
-                  modeName(s.mode), brg, s.yawTargetDeg, s.yawDeg, s.imuGood ? "" : "!", tof, vis, s.boxRatio,
-                  s.vL, s.vR, s.tgtL, s.tgtR, s.pwmL, s.pwmR, (long)s.encL, (long)s.encR,
-                  s.ctlDtMaxMs, s.btnLevel, (unsigned long)s.btnPresses);
+    if (SERIAL_FRAME_LOG) {
+        Serial.printf("[Robot] %s brg=%s yawT=%+.1f yaw=%+.1f%s | tof=%s vis=%s ratio=%.2f | v=%.0f/%.0f tgt=%.0f/%.0f pwm=%d/%d | enc=%ld/%ld | ctl=%.1fms | btn=%d/%lu\n",
+                      modeName(s.mode), brg, s.yawTargetDeg, s.yawDeg, s.imuGood ? "" : "!", tof, vis, s.boxRatio,
+                      s.vL, s.vR, s.tgtL, s.tgtR, s.pwmL, s.pwmR, (long)s.encL, (long)s.encR,
+                      s.ctlDtMaxMs, s.btnLevel, (unsigned long)s.btnPresses);
+    }
     // Bản gọn cho BLE (~75 ký tự/frame): chế độ, góc, yaw, tof, vis, tốc độ đo/đích, pwm, chu kỳ điều khiển lớn nhất
     BleLog::log("R %s b=%s y=%+.1f%s t=%s vis=%s v=%.0f/%.0f g=%.0f/%.0f p=%d/%d c=%.1f",
                 modeName(s.mode), brg, s.yawDeg, s.imuGood ? "" : "!", tof, vis,

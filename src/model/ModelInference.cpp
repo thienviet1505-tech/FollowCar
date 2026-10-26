@@ -21,22 +21,10 @@
 
 #include "model_data.h"
 
-// Tắt từng phần để so sánh: thêm vào build_flags  -DMODEL_IN_PSRAM=0  hoặc  -DNN_DUAL_CORE=0
-#ifndef MODEL_IN_PSRAM
-#define MODEL_IN_PSRAM 1
-#endif
-#ifndef NN_DUAL_CORE
-#define NN_DUAL_CORE 1
-#endif
-// Tự đo từng conv 3x3 lúc khởi động và chọn cách chạy nhanh nhất (xem ConvOptTune.h).
-// Tắt: -DCONV_OPT_AUTOTUNE=0 (mọi conv chạy bằng kernel ESP-NN gốc).
-#ifndef CONV_OPT_AUTOTUNE
-#define CONV_OPT_AUTOTUNE 1
-#endif
-// Profiler chỉ bật khi cần:  -DPROFILE_OPS=1  (in bảng thời gian từng op sau mỗi lần invoke).
-#ifndef PROFILE_OPS
-#define PROFILE_OPS 0
-#endif
+// Các macro MODEL_IN_PSRAM, NN_DUAL_CORE, CONV_OPT_AUTOTUNE, PROFILE_OPS, NN_SCRATCH_PREALLOC nằm trong RobotConfig.h.
+// Include SAU các header ở trên (đúng vị trí các #define cũ) để các header đó thấy macro y như trước.
+#include "RobotConfig.h"
+
 
 // Đa lõi của ESP-NN (esp-nn/include/esp_nn_multicore.h).
 extern "C" {
@@ -48,10 +36,7 @@ void* esp_nn_dual_core_scratch(int size);
 // Cấp sẵn scratch dùng chung của ESP-NN dual-core ngay khi khởi động (byte).
 // Lớp conv 3x3 K=1152 cần 62.560 B; nếu để thư viện tự tăng dần, lúc cần thì RAM nội
 // đã phân mảnh (khối lớn nhất < 62,5 KB) -> rơi sang PSRAM -> các lớp K=1152 chậm.
-// Đặt 0 để tắt.
-#ifndef NN_SCRATCH_PREALLOC
-#define NN_SCRATCH_PREALLOC 65536
-#endif
+// Đặt NN_SCRATCH_PREALLOC = 0 trong RobotConfig.h để tắt.
 
 // true: input model là [1,H,W,3] (NHWC); false: [1,3,H,W] (NCHW). main.cpp dùng (ngoài namespace ẩn danh để main.cpp thấy được) để ghi ảnh đúng layout.
 bool g_model_input_nhwc = false;
@@ -389,7 +374,7 @@ void ModelInference::printProfile() {
     Serial.println("=======================================================");
     profiler.ClearEvents();
 #else
-    Serial.println("[Profile] Build voi -DPROFILE_OPS=1 de bat profiler.");
+    Serial.println("[Profile] Dat PROFILE_OPS 1 trong RobotConfig.h de bat profiler.");
 #endif
 }
 

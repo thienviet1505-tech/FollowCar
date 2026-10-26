@@ -1,6 +1,8 @@
 #include "ViewMode.h"
 #include <Arduino.h>
+#if ROBOT_VIEW_MODE
 #include <WiFi.h>
+#endif
 #include <esp_heap_caps.h>
 #include "Robot.h"
 #include "BleLog.h"
@@ -17,14 +19,21 @@ void printMem(const char* tag) {
 }
 
 void printHelp() {
+#if ROBOT_VIEW_MODE
     Serial.println("[Lenh] v = xem anh camera tren trinh duyet (bat WiFi, tam dung nhan dien)");
     Serial.println("[Lenh] d = ve che do nhan dien (tat WiFi)");
+#else
+    Serial.println("[Lenh] (che do VIEW da tat luc build: ROBOT_VIEW_MODE = 0 trong RobotConfig.h)");
+#endif
     Serial.println("[Lenh] t = chay lai self-test voi anh mau to 100k");
     Serial.println("[Lenh] p = in thong so camera hien tai de dan vao CameraModule.cpp");
     Serial.println("[Lenh] m = in RAM con trong    ? = tro giup");
-    Serial.println("[Lenh] b = bat/tat log Bluetooth LE (tat thi giai phong SRAM; nho qua lan khoi dong; tu tam tat khi o VIEW)");
-    Serial.println("[Nut ] G0 (BOOT) = doi qua lai giua v va d (xe tu dung khi vao che do xem anh)");
+#if ROBOT_VIEW_MODE
+    if (Cfg::BUTTON_ENABLE) Serial.println("[Nut ] G0 (BOOT) = doi qua lai giua v va d (xe tu dung khi vao che do xem anh)");
+#endif
 }
+
+#if ROBOT_VIEW_MODE
 
 void startView() {
     IPAddress ip;
@@ -97,6 +106,10 @@ void leaveView(CameraModule& camera) {
     BleLog::resume();
     Robot::setEnabled(true);
 }
+#else
+void enterView() { Serial.println("[View] Da tat luc build (ROBOT_VIEW_MODE = 0 trong RobotConfig.h)"); }
+void leaveView(CameraModule&) {}
+#endif
 
 }  // namespace
 
@@ -131,10 +144,6 @@ void handleSerial(CameraModule& camera) {
                 break;
             case 'm': case 'M':
                 printMem("hien tai");
-                break;
-            case 'b': case 'B':
-                BleLog::toggle();
-                printMem("sau khi doi BLE");
                 break;
             case '?': case 'h': case 'H':
                 printHelp();

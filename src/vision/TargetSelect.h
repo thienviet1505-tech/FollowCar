@@ -75,7 +75,7 @@ public:
             if (holding_) {
                 if (++miss_ > maxMiss) {
                     reset();
-                    graceFrames_ = Cfg::REACQUIRE_GRACE_FRAMES;
+                    graceFrames_ = Cfg::REACQUIRE_GRACE ? Cfg::REACQUIRE_GRACE_FRAMES : 0;
                 }
             } else if (graceFrames_ > 0) {
                 graceFrames_--;

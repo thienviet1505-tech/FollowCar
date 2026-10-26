@@ -65,6 +65,10 @@ inline float slew(float cur, float target, float maxDelta) {
 // nên khi đảo chiều PWM nhảy +DEADBAND -> -DEADBAND trong 1 chu kỳ).
 inline float feedForwardPwm(float vMmS) {
     const float a = fabsf(vMmS);
+    if (!Cfg::FF_SMOOTH_ZERO) {   // bản gốc: nhảy thẳng 0 -> PWM_DEADBAND
+        if (a < 1.0f) return 0.0f;
+        return sgnf(vMmS) * (Cfg::PWM_DEADBAND + (Cfg::PWM_MAX - Cfg::PWM_DEADBAND) * a / Cfg::V_AT_PWM_MAX_MM_S);
+    }
     const float atKnee = Cfg::PWM_DEADBAND +
                          (Cfg::PWM_MAX - Cfg::PWM_DEADBAND) * Cfg::FF_KNEE_MM_S / Cfg::V_AT_PWM_MAX_MM_S;
     const float pwm = (a < Cfg::FF_KNEE_MM_S)
@@ -93,8 +97,12 @@ struct WheelPid {
         const float cmd = clampf(feedForwardPwm(ramp) + Cfg::SPD_KP * err + integ,
                                  -(float)Cfg::PWM_MAX, (float)Cfg::PWM_MAX);
         // Giới hạn tốc độ đổi PWM (giảm dòng đỉnh / sụt áp). Đang bị giới hạn thì không tích thêm tích phân (chống windup).
-        pwmPrev = slew(pwmPrev, cmd, Cfg::PWM_SLEW_PER_S * dt);
-        if (pwmPrev != cmd) integ = integOld;
+        if (Cfg::PWM_SLEW_LIMIT) {
+            pwmPrev = slew(pwmPrev, cmd, Cfg::PWM_SLEW_PER_S * dt);
+            if (pwmPrev != cmd) integ = integOld;
+        } else {
+            pwmPrev = cmd;
+        }
         pwmOut = pwmPrev;
         return false;
     }
@@ -152,7 +160,7 @@ inline FollowCmd followLaw(float yawErr, float rateDps, uint16_t tofMm, bool tof
     // Nhờ đó khi giơ tiền trên cao (ToF bắn trượt ra xa), visDistMm vẫn giúp xe dừng đúng ở 15cm!
     uint16_t effDistMm = Cfg::TOF_NONE_MM;
     if (tofValid && visValid) {
-        effDistMm = (tofMm < visDistMm) ? tofMm : visDistMm;
+        effDistMm = (!Cfg::TOF_FUSE_DISTANCE || visDistMm <= tofMm) ? visDistMm : tofMm;   // TOF_FUSE_DISTANCE = false: tin camera
     } else if (visValid) {
         effDistMm = visDistMm;
     } else if (tofValid) {

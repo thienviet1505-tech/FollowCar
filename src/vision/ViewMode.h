@@ -1,5 +1,6 @@
 #pragma once
 #include "CameraModule.h"
+#include "RobotConfig.h"   // ROBOT_VIEW_MODE
 
 // ==== CẤU HÌNH WIFI CHO CHẾ ĐỘ XEM ẢNH (chỉ dùng khi gõ 'v') ====
 // Thứ tự: thử nối vào WiFi nhà (STA) trong VIEW_STA_TIMEOUT_MS; nếu không nối

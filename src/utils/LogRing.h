@@ -1,6 +1,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 // Bộ đệm vòng chứa các dòng log (mỗi dòng kết thúc bằng '\n').
 // Đầy thì bỏ DÒNG CŨ NHẤT để nhường chỗ (luôn giữ được những dòng mới nhất, không bao giờ chặn người ghi).
@@ -25,10 +26,10 @@ struct LogRing {
             }
             droppedLines++;
         }
-        for (size_t i = 0; i < n; i++) {
-            buf[head] = d[i];
-            head = (head + 1) % cap;
-        }
+        const size_t first = (n < cap - head) ? n : cap - head;   // đoạn tới cuối bộ đệm
+        memcpy(buf + head, d, first);
+        memcpy(buf, d + first, n - first);
+        head = (head + n) % cap;
         used += n;
         return true;
     }
@@ -36,10 +37,10 @@ struct LogRing {
     // Lấy tối đa max byte cũ nhất ra out.
     size_t pop(uint8_t* out, size_t max) {
         const size_t n = used < max ? used : max;
-        for (size_t i = 0; i < n; i++) {
-            out[i] = (uint8_t)buf[tail];
-            tail = (tail + 1) % cap;
-        }
+        const size_t first = (n < cap - tail) ? n : cap - tail;
+        memcpy(out, buf + tail, first);
+        memcpy(out + first, buf, n - first);
+        tail = (tail + n) % cap;
         used -= n;
         return n;
     }
