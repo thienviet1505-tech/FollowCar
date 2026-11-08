@@ -27,4 +27,8 @@ bool active();
 // Cùng hàm này xử lý nút G0 (BOOT): bấm = đổi qua lại v <-> d.
 void handleSerial(CameraModule& camera);
 
+// Lệnh 't' (hoặc nơi khác) yêu cầu chạy self-test; main.cpp lấy yêu cầu đúng một lần bằng takeSelfTestRequest().
+void requestSelfTest();
+bool takeSelfTestRequest();
+
 }  // namespace ViewMode

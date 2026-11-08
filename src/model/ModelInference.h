@@ -17,27 +17,21 @@ public:
     const int8_t* pixelLut() const { return pixel_lut_; }
 
     // Chạy model, sau đó giải lượng tử output sang float.
+    // (Nếu bật PROFILE_OPS, profile của lần invoke đầu tiên được tự động in ra Serial.)
     bool invoke();
-
-    // In profile của lần Invoke đầu tiên ra Serial.
-    // Profile được tự động in sau lần invoke đầu tiên nên main.cpp không cần sửa.
-    void printProfile();
 
     int inputWidth() const { return input_width_; }
     int inputHeight() const { return input_height_; }
-    int inputChannels() const { return input_channels_; }
     size_t inputBytes() const { return input_bytes_; }
-    float inputScale() const { return input_scale_; }
-    int inputZeroPoint() const { return input_zero_point_; }
+    // true: input là [1,H,W,3] (NHWC); false: [1,3,H,W] (NCHW). Quyết định cách ghi ảnh vào inputData().
+    bool inputIsNhwc() const { return input_nhwc_; }
 
     const float* outputData() const { return output_f_.data(); }
-    int outputElements() const;
     int outputNumDims() const;
     int outputDim(int index) const;
-    float outputScale() const { return output_scale_; }
-    int outputZeroPoint() const { return output_zero_point_; }
 
 private:
+    bool input_nhwc_ = false;
     int input_width_ = 0;
     int input_height_ = 0;
     int input_channels_ = 0;

@@ -8,7 +8,6 @@ struct Detection {
     float score = 0.0f;
     int cx = 0, cy = 0;  // tâm box, pixel theo ảnh gốc
     int w = 0, h = 0;    // kích thước box, pixel theo ảnh gốc
-    int area() const { return w * h; }
 };
 
 class Detector {
@@ -21,8 +20,4 @@ public:
     // ngưỡng) — để biết model "đang nghĩ gì" kể cả khi chưa vượt CONF_THRESHOLD.
     static const std::vector<float>& classMaxScores();
 
-private:
-    static float dequant(int8_t raw, float scale, int zeroPoint) {
-        return (raw - zeroPoint) * scale;
-    }
 };

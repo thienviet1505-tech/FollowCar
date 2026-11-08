@@ -49,9 +49,9 @@ inline float bearingDeg(float cx, float imgW) {
 
 // Ước lượng khoảng cách tới tờ tiền (mm) dựa trên tỉ lệ kích thước Bounding Box (boxRatio = max(w, h) / imgW)
 inline uint16_t estimateVisualDistMm(float boxRatio) {
-    if (boxRatio <= 0.02f) return Cfg::TOF_NONE_MM;
+    if (boxRatio <= Cfg::BOX_RATIO_MIN) return Cfg::TOF_NONE_MM;
     const float dist = (float)Cfg::FOLLOW_DISTANCE_MM * (Cfg::BOX_RATIO_AT_FOLLOW_DIST / boxRatio);
-    return (uint16_t)clampf(dist, 50.0f, (float)Cfg::TOF_MAX_MM);
+    return (uint16_t)clampf(dist, Cfg::VIS_DIST_MIN_MM, (float)Cfg::TOF_MAX_MM);
 }
 
 inline float slew(float cur, float target, float maxDelta) {
@@ -83,6 +83,8 @@ struct WheelPid {
 
     void reset() { target = ramp = integ = pwmPrev = 0; }
 
+    // Trả true khi bánh đã dừng hẳn (đích = 0 và ramp đã về 0): khi đó pwmOut = 0 và tích phân được xóa.
+    // Ngược lại trả false và pwmOut = PWM có dấu (chưa làm tròn).
     bool step(float vMeas, float dt, float& pwmOut) {
         ramp = slew(ramp, target, Cfg::ACCEL_MM_S2 * dt);
         if (target == 0.0f && ramp == 0.0f) {
@@ -108,36 +110,65 @@ struct WheelPid {
     }
 };
 
-// Lịch sử yaw (vòng 64 mẫu = 0.64 s ở 100 Hz) để tra yaw tại thời điểm chụp ảnh (bù độ trễ nhận diện).
-// Cũng dùng lại cho quãng đường (mm) để bù độ trễ khoảng cách.
-struct YawHistory {
+// Đo vận tốc 2 bánh (mm/s) trên cửa sổ SPEED_WINDOW_TICKS chu kỳ gần nhất (giảm nhiễu lượng tử hóa 1 xung/chu kỳ).
+// push() mỗi chu kỳ điều khiển với giá trị encoder (đã nhân dấu) và thời điểm (us).
+struct SpeedEstimator {
+    static constexpr int W = Cfg::SPEED_WINDOW_TICKS + 1;
+    int32_t encL[W] = {0}, encR[W] = {0};
+    int64_t t[W] = {0};
+    int head = 0, count = 0;
+    float vL = 0, vR = 0;   // mm/s, giữ giá trị cũ cho tới khi đủ 2 mẫu
+
+    void reset() { head = 0; count = 0; vL = vR = 0; }
+
+    void push(int64_t tUs, int32_t l, int32_t r) {
+        encL[head] = l;
+        encR[head] = r;
+        t[head] = tUs;
+        head = (head + 1) % W;
+        if (count < W) count++;
+        if (count < 2) return;
+        const int newest = (head - 1 + W) % W;
+        const int oldest = (head - count + W) % W;
+        const float span = (float)(t[newest] - t[oldest]) * 1e-6f;
+        if (span > 0.0f) {
+            vL = countsPerSecToMmPerSec((float)(encL[newest] - encL[oldest]) / span);
+            vR = countsPerSecToMmPerSec((float)(encR[newest] - encR[oldest]) / span);
+        }
+    }
+};
+
+// Lịch sử một đại lượng theo thời gian (vòng 64 mẫu = 0.64 s ở 100 Hz) để tra giá trị tại thời điểm chụp ảnh
+// (bù độ trễ nhận diện). Dùng cho yaw (độ) và cho quãng đường (mm).
+struct History {
     static constexpr int N = 64;
     int64_t t[N] = {0};
-    float y[N] = {0};
+    float v[N] = {0};
     int head = 0, count = 0;
 
     void clear() { head = 0; count = 0; }
-    void push(int64_t tUs, float yaw) {
+    void push(int64_t tUs, float value) {
         t[head] = tUs;
-        y[head] = yaw;
+        v[head] = value;
         head = (head + 1) % N;
         if (count < N) count++;
     }
+    // Giá trị tại thời điểm tUs (nội suy tuyến tính); ngoài khoảng đã lưu thì lấy mẫu gần nhất; chưa có mẫu nào thì trả fallback.
     float at(int64_t tUs, float fallback) const {
         if (count == 0) return fallback;
         const int newest = (head - 1 + N) % N;
-        if (tUs >= t[newest]) return y[newest];
+        if (tUs >= t[newest]) return v[newest];
         const int oldest = (head - count + N) % N;
-        if (tUs <= t[oldest]) return y[oldest];
+        if (tUs <= t[oldest]) return v[oldest];
         for (int i = 1; i < count; i++) {
             const int b = (head - 1 - (i - 1) + N) % N;
             const int a = (b - 1 + N) % N;
             if (tUs >= t[a] && tUs <= t[b]) {
                 const float f = (float)(tUs - t[a]) / (float)(t[b] - t[a] > 0 ? t[b] - t[a] : 1);
-                return y[a] + f * (y[b] - y[a]);
+                return v[a] + f * (v[b] - v[a]);
             }
         }
-        return y[newest];
+        return v[newest];
     }
 };
 

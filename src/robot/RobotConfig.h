@@ -58,6 +58,10 @@ constexpr float SPEED_SCALE = 1.0f;
 
 // ============================== BÁM THEO =====================================
 constexpr int TARGET_CLASS = 2;                        // lớp tiền cần bám: 0=100k 1=10k 2=50k 3=5k
+// Tên lớp theo thứ tự id của model (dùng cho log). Sửa lại nếu train lại model với bộ lớp khác.
+constexpr const char* const CLASS_NAMES[] = {"100k", "10k", "50k", "5k"};
+constexpr int NUM_CLASS_NAMES = (int)(sizeof(CLASS_NAMES) / sizeof(CLASS_NAMES[0]));
+inline const char* className(int id) { return (id >= 0 && id < NUM_CLASS_NAMES) ? CLASS_NAMES[id] : "?"; }
 
 // Ngưỡng kép (Hysteresis) giúp bắt mục tiêu nhạy ở ~6 FPS mà không bị báo giả:
 // - DETECT_CONF_THRESHOLD: ngưỡng giải mã cơ bản cho Detector::decode() (phải <= DETECT_GATE_THRESH)
@@ -65,13 +69,14 @@ constexpr int TARGET_CLASS = 2;                        // lớp tiền cần bá
 // - DETECT_HOLD_THRESH   : ngưỡng để duy trì bám khi vừa thấy tiền ở frame trước (box ở chỗ khác)
 // - DETECT_GATE_THRESH   : ngưỡng cho box nằm đúng chỗ dự kiến của tiền đang bám (xem GATE_*)
 constexpr float DETECT_CONF_THRESHOLD = 0.25f;
-constexpr float DETECT_ACQUIRE_THRESH = 0.45f;
+constexpr float DETECT_ACQUIRE_THRESH = 0.50f;
 constexpr float DETECT_HOLD_THRESH    = 0.35f;
 constexpr float DETECT_GATE_THRESH    = 0.30f;   // ngưỡng cố định trong cổng (khi DETECT_SCORE_SMOOTH = false)
 constexpr float DETECT_GATE_MIN_THRESH = 0.25f;  // ngưỡng thấp nhất trong cổng (khi DETECT_SCORE_SMOOTH và mục tiêu đang bám chắc)
 static_assert(DETECT_CONF_THRESHOLD <= DETECT_GATE_MIN_THRESH && DETECT_GATE_MIN_THRESH <= DETECT_GATE_THRESH &&
               DETECT_GATE_THRESH <= DETECT_HOLD_THRESH,
               "can DETECT_CONF_THRESHOLD <= DETECT_GATE_MIN_THRESH <= DETECT_GATE_THRESH <= DETECT_HOLD_THRESH");
+constexpr float NMS_IOU_THRESHOLD = 0.45f;             // NMS: hai box cùng lớp chồng nhau hơn mức này thì bỏ box điểm thấp
 
 // ---- Các tính năng thêm vào để giảm khựng / mất tiền: bật-tắt từng cái để kiểm chứng trên xe thật ----
 // Tất cả false = hành vi như bản gốc (ngoài các thông số rẽ/ACCEL). Nếu xe xấu đi, tắt lần lượt từng cái để tìm thủ phạm.
@@ -99,21 +104,23 @@ constexpr int GATE_MAX_MISS_FRAMES = 3;                // (cũ 2) hụt tối đ
 // thay vì DETECT_ACQUIRE_THRESH (xe chạy giật làm ảnh nhòe, điểm tụt dưới 0.45 nên trước đây xe đứng chờ rất lâu). 0 = tắt.
 constexpr int REACQUIRE_GRACE_FRAMES = 8;
 
-constexpr uint16_t FOLLOW_DISTANCE_MM = 150;           // khoảng cách dừng trước tờ tiền: 150 mm (15 cm)
+constexpr uint16_t FOLLOW_DISTANCE_MM = 80;           // khoảng cách dừng trước tờ tiền: 80 mm (8 cm)
 constexpr float FOLLOW_DEADBAND_MM = 15.0f;            // chỉ dùng khi FOLLOW_HOLD_HYSTERESIS = false: sai lệch nhỏ hơn mức này thì đứng yên
 // Khi FOLLOW_HOLD_HYSTERESIS: dừng đúng FOLLOW_DISTANCE_MM; đã dừng thì chỉ tiến lại khi xa hơn FOLLOW_DISTANCE_MM + FOLLOW_RESUME_MM,
 // và chỉ lùi khi gần hơn FOLLOW_DISTANCE_MM - FOLLOW_REVERSE_MM (chống tiến/lùi liên tục do box nhiễu).
 constexpr float FOLLOW_RESUME_MM = 30.0f;
 constexpr float FOLLOW_REVERSE_MM = 40.0f;
-constexpr bool ALLOW_REVERSE_WHEN_CLOSE = true;        // true = lùi khi tiền quá gần; false = chỉ dừng
+constexpr bool ALLOW_REVERSE_WHEN_CLOSE = false;        // true = lùi khi tiền quá gần; false = chỉ dừng
 
 // Dừng theo kích thước Bounding Box khi giơ tiền cao (VL53L0X không bắn trúng).
-// boxRatio = max(w,h) / bề rộng ảnh (tối đa ~1.0). Với 0.85: tiến khi boxRatio < ~0.77 (123 px), dừng trong ~0.77..0.94, lùi khi > ~0.94 (151 px).
+// boxRatio = max(w,h) / bề rộng ảnh (tối đa ~1.0). Với 0.75: tiến khi boxRatio < ~0.60 (96 px), dừng trong ~0.60..0.85, lùi khi > ~0.85 (136 px).
 // Công thức: dừng/lùi theo khoảng cách ước lượng = FOLLOW_DISTANCE * BOX_RATIO_AT_FOLLOW_DIST / boxRatio; chỉnh lại khi chạy thực tế:
 // - Xe dừng khi còn quá xa: TĂNG BOX_RATIO_AT_FOLLOW_DIST.
 // - Xe tiến quá sát mới dừng: GIẢM BOX_RATIO_AT_FOLLOW_DIST.
-constexpr float BOX_RATIO_AT_FOLLOW_DIST = 0.85f;
+constexpr float BOX_RATIO_AT_FOLLOW_DIST = 0.75f;
 constexpr float BOX_RATIO_FILTER_ALPHA   = 0.50f;      // hệ số lọc khoảng cách ước lượng từ box khi có frame mới (0..1)
+constexpr float VIS_DIST_MIN_MM = 50.0f;               // khoảng cách ước lượng từ box không bao giờ nhỏ hơn mức này
+constexpr float BOX_RATIO_MIN = 0.02f;                 // boxRatio <= mức này coi như không có box (không ước lượng khoảng cách)
 
 constexpr float KP_DIST = 1.8f;                        // vận tốc (mm/s) = KP_DIST * (sai lệch khoảng cách mm)
 constexpr float KP_DIST_BACK = 6.0f;                   // như KP_DIST nhưng cho chiều LÙI (box không to hơn ảnh nên cần hệ số lớn hơn)
@@ -137,11 +144,12 @@ constexpr uint32_t LOST_TIMEOUT_MS = 1000;             // giữ trạng thái b�
 constexpr int REACQUIRE_FRAMES = 1;                    // với ngưỡng kép (Acquire 0.45), thấy 1 frame chắc chắn là bám ngay
 
 // ============================== AN TOÀN ToF ==================================
-constexpr uint16_t TOF_STOP_MM = 120;                  // bất kỳ vật cản nào gần hơn 12cm trước VL53L0X -> dừng tiến ngay
-constexpr uint16_t TOF_RESUME_MM = 140;                // xa hơn 14cm mới cho phép tiến lại
+constexpr uint16_t TOF_STOP_MM = 80;                  // bất kỳ vật cản nào gần hơn 8cm trước VL53L0X -> dừng tiến ngay
+constexpr uint16_t TOF_RESUME_MM = 100;                // xa hơn 10cm mới cho phép tiến lại
 constexpr uint32_t TOF_STALE_MS = 500;                 // ToF không cập nhật quá lâu
 constexpr int TOF_PERIOD_MS = 50;                      // chu kỳ đo liên tục của VL53L0X (20 Hz)
 constexpr uint16_t TOF_NONE_MM = 9999;                 // quy ước: không thấy vật / ngoài tầm
+constexpr int16_t TOF_BIAS_MM = 40;                    // ToF đọc cao hơn khoảng cách thật chừng này (mm); đã bù = đọc - TOF_BIAS_MM
 constexpr uint16_t TOF_MAX_MM = 2000;                  // xa hơn mức này coi như không thấy
 
 // ============================== NÚT BẤM ======================================
@@ -181,6 +189,9 @@ constexpr int CTRL_PERIOD_MS = 10;                     // 100 Hz
 constexpr int CTRL_CORE = 0;                           // loop() chạy lõi 1
 constexpr int CTRL_TASK_PRIO = 20;
 constexpr int CTRL_TASK_STACK = 8192;
+constexpr float CTRL_DT_MAX_PID_S = 0.05f;             // kẹp dt đưa vào PID/ramp (s): chu kỳ bị trễ lớn (vd. sau hiệu chỉnh gyro) không làm tích phân nhảy
+constexpr float CTRL_DT_MAX_SENSOR_S = 0.1f;           // kẹp dt đưa vào tích phân góc yaw (s)
+constexpr int CTRL_STATS_TICKS = 200;                  // báo chu kỳ điều khiển trễ nhất theo cửa sổ 200 tick (2 s)
 constexpr int SPEED_WINDOW_TICKS = 5;                   // đo vận tốc bánh trên cửa sổ 5 chu kỳ x 10 ms = 50 ms (1 xung ~ 6 mm/s thay vì ~30 mm/s)
 constexpr float SPD_KP = 0.20f;
 constexpr float SPD_KI = 2.60f;
@@ -190,13 +201,21 @@ constexpr float FF_KNEE_MM_S = 10.0f;                  // dưới tốc độ n�
 constexpr float ACCEL_MM_S2 = 900.0f;                // gia tốc tối đa của vận tốc đích bánh (thấp = êm nhưng quay/đảo chiều chậm: 800 mất 0.26 s để lên 209 mm/s)
 
 // ============================== MPU6050 ======================================
+constexpr uint8_t MPU_I2C_ADDR = 0x68;
+constexpr uint32_t I2C_CLOCK_HZ = 400000;
 constexpr float MPU_YAW_MOUNT_DEG = 45.0f;             // MPU6050 nằm ngang, lệch 45 độ so với phương di chuyển
+constexpr float IMU_ACCEL_MIN_MS2 = 4.0f;              // |accel| ngoài [IMU_ACCEL_MIN_MS2, IMU_ACCEL_MAX_MS2] = mẫu IMU hỏng
+constexpr float IMU_ACCEL_MAX_MS2 = 25.0f;
+constexpr int IMU_BAD_TICKS = 5;                       // chừng này mẫu hỏng liên tiếp thì imuGood = false
 constexpr int GYRO_CAL_SAMPLES = 150;                  // 150 mẫu x 10ms = 1.5 s đứng yên lúc khởi động
 constexpr float GYRO_CAL_MAX_RANGE_DPS = 3.0f;
+constexpr float GYRO_CAL_ACCEL_MIN_MS2 = 7.0f;         // hiệu chỉnh: |accel| trung bình phải nằm trong [7, 12.5] m/s2 (1 g = 9.8), ngoài mức này = xe đang rung/nghiêng
+constexpr float GYRO_CAL_ACCEL_MAX_MS2 = 12.5f;
 constexpr uint32_t GYRO_RETRY_MS = 1000;
 
 // Chống trôi góc Yaw khi xe đứng yên (Zero-Velocity Update - ZUPT):
 constexpr int ZUPT_HOLD_TICKS = 8;                     // 8 chu kỳ x 10ms = 80ms cả 2 bánh không quay -> kích hoạt ZUPT
+constexpr int STATIONARY_TICKS_MAX = 1000;             // bộ đếm "2 bánh đứng yên" dừng đếm ở mức này
 constexpr float ZUPT_MAX_RATE_DPS = 2.5f;              // ngưỡng tốc độ góc tối đa coi là nhiễu trôi khi đứng yên
 constexpr float GYRO_BIAS_ADAPT_ALPHA = 0.005f;        // tốc độ tự thích nghi bias nhiệt khi xe đứng yên
 

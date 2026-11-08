@@ -85,8 +85,6 @@ public:
     }
 
     void reset() { holding_ = false; fused_ = 0.0f; miss_ = 0; graceFrames_ = 0; }
-    bool holding() const { return holding_; }
-    float fusedScore() const { return fused_; }
 
 private:
     // Ngưỡng cho box trong cổng: cố định DETECT_GATE_THRESH, hoặc (3a) trượt từ DETECT_HOLD_THRESH (điểm EMA <= SCORE_STRONG_LOW)

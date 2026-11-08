@@ -14,20 +14,16 @@ namespace BleLog {
 
 #if ROBOT_BLE_LOG
 
-constexpr bool compiled() { return true; }
 void begin();                                   // bật BLE + task gửi. Gọi CUỐI setup() (sau khi camera/model đã lấy bộ nhớ).
 bool enabled();                                 // BLE + bộ đệm đang chạy (đang chiếm SRAM)
-bool connected();                               // có điện thoại đang kết nối
 void pause();                                   // tạm tắt khi vào chế độ VIEW (WiFi)
 void resume();                                  // bật lại khi thoát VIEW
 void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));   // không chặn; tắt thì return ngay
 
 #else
 
-constexpr bool compiled() { return false; }
 inline void begin() {}
 inline bool enabled() { return false; }
-inline bool connected() { return false; }
 inline void pause() {}
 inline void resume() {}
 inline void log(const char*, ...) {}

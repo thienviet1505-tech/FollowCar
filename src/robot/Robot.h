@@ -33,11 +33,6 @@ bool takeButtonPress();
 // boxRatio: max(w, h) / origW của tờ tiền (0 nếu không thấy), dùng để ước lượng khoảng cách khi giơ tiền cao.
 void onDetection(bool seen, float bearingDeg, float boxRatio, int64_t frameTimeUs);
 
-// Overload 3 tham số để tương thích ngược nếu gọi kiểu cũ
-inline void onDetection(bool seen, float bearingDeg, int64_t frameTimeUs) {
-    onDetection(seen, bearingDeg, 0.0f, frameTimeUs);
-}
-
 State state();
 void printFrameLine();
 

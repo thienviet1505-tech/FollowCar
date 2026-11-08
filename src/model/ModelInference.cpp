@@ -33,14 +33,6 @@ bool esp_nn_dual_core_active(void);
 void* esp_nn_dual_core_scratch(int size);
 }
 
-// Cấp sẵn scratch dùng chung của ESP-NN dual-core ngay khi khởi động (byte).
-// Lớp conv 3x3 K=1152 cần 62.560 B; nếu để thư viện tự tăng dần, lúc cần thì RAM nội
-// đã phân mảnh (khối lớn nhất < 62,5 KB) -> rơi sang PSRAM -> các lớp K=1152 chậm.
-// Đặt NN_SCRATCH_PREALLOC = 0 trong RobotConfig.h để tắt.
-
-// true: input model là [1,H,W,3] (NHWC); false: [1,3,H,W] (NCHW). main.cpp dùng (ngoài namespace ẩn danh để main.cpp thấy được) để ghi ảnh đúng layout.
-bool g_model_input_nhwc = false;
-
 namespace {
 const tflite::Model* tfl_model = nullptr;
 tflite::MicroInterpreter* interpreter = nullptr;
@@ -236,6 +228,10 @@ bool ModelInference::begin(size_t tensor_arena_size) {
     esp_nn_dual_core_enable();   // gọi từ core chạy suy luận (loopTask)
     Serial.printf("[Model] ESP-NN dual-core: %s\n", esp_nn_dual_core_active() ? "ON" : "OFF");
 #if NN_SCRATCH_PREALLOC > 0
+    // Cấp sẵn scratch dùng chung của ESP-NN dual-core ngay khi khởi động (byte).
+    // Lớp conv 3x3 K=1152 cần 62.560 B; nếu để thư viện tự tăng dần, lúc cần thì RAM nội
+    // đã phân mảnh (khối lớn nhất < 62,5 KB) -> rơi sang PSRAM -> các lớp K=1152 chậm.
+    // Đặt NN_SCRATCH_PREALLOC = 0 trong RobotConfig.h để tắt.
     if (esp_nn_dual_core_active()) {
         void* scr = esp_nn_dual_core_scratch(NN_SCRATCH_PREALLOC);
         Serial.printf("[Model] dual-core scratch=%d B @%p (%s) | internal free=%u largest=%u\n",
@@ -260,14 +256,14 @@ bool ModelInference::begin(size_t tensor_arena_size) {
     }
 
     // Model input shape: [1, C, H, W] (NCHW) hoặc [1, H, W, C] (NHWC, bản đã bỏ TRANSPOSE đầu).
-    // Nhận biết theo vị trí kênh 3; main.cpp đọc g_model_input_nhwc để ghi đúng layout.
+    // Nhận biết theo vị trí kênh 3; Preprocess đọc inputIsNhwc() để ghi đúng layout.
     if (input_tensor->dims->data[3] == 3 && input_tensor->dims->data[1] != 3) {
-        g_model_input_nhwc = true;
+        input_nhwc_ = true;
         input_height_ = input_tensor->dims->data[1];
         input_width_ = input_tensor->dims->data[2];
         input_channels_ = input_tensor->dims->data[3];
     } else {
-        g_model_input_nhwc = false;
+        input_nhwc_ = false;
         input_channels_ = input_tensor->dims->data[1];
         input_height_ = input_tensor->dims->data[2];
         input_width_ = input_tensor->dims->data[3];
@@ -335,12 +331,10 @@ int8_t* ModelInference::inputData() {
 bool ModelInference::invoke() {
     if (!interpreter || !input_tensor || !output_tensor) return false;
 
-    Serial.println("[NN] INT8 invoke start");
     if (interpreter->Invoke() != kTfLiteOk) {
         Serial.println("[NN] INT8 invoke FAIL");
         return false;
     }
-    Serial.println("[NN] INT8 invoke end");
 
 #if PROFILE_OPS
     // MicroProfiler chỉ chứa tối đa 4096 sự kiện (~283/lần invoke) -> in xong phải xoá,
@@ -364,22 +358,6 @@ bool ModelInference::invoke() {
         out[i] = (float)((int)q[i] - output_zero_point_) * output_scale_;
     }
     return true;
-}
-
-void ModelInference::printProfile() {
-#if PROFILE_OPS
-    Serial.println();
-    Serial.println("================ TFLITE MICRO PROFILE ================");
-    profiler.Log();
-    Serial.println("=======================================================");
-    profiler.ClearEvents();
-#else
-    Serial.println("[Profile] Dat PROFILE_OPS 1 trong RobotConfig.h de bat profiler.");
-#endif
-}
-
-int ModelInference::outputElements() const {
-    return output_tensor ? output_tensor->bytes : 0;
 }
 
 int ModelInference::outputNumDims() const {

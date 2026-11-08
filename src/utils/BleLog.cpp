@@ -30,7 +30,6 @@ enum class St : uint8_t { OFF, RUNNING };
 
 volatile St s_state = St::OFF;
 volatile bool s_reqStop = false;           // yêu cầu task gửi tự dọn dẹp rồi thoát (chỉ dùng khi pause())
-volatile bool s_connected = false;
 volatile uint16_t s_mtu = 23;
 bool s_started = false;                    // begin() đã được gọi -> resume() mới bật lại
 
@@ -63,7 +62,6 @@ void teardown() {
     s_server = nullptr;
     s_tx = nullptr;
     if (mem) heap_caps_free(mem);
-    s_connected = false;
     s_mtu = 23;
 }
 
@@ -75,7 +73,7 @@ void senderTask(void*) {
     while (!s_reqStop) {
         const int nconn = s_server ? (int)s_server->getConnectedCount() : 0;
         if (nconn == 0) {
-            if (wasConn) { wasConn = false; s_connected = false; s_mtu = 23; }
+            if (wasConn) { wasConn = false; s_mtu = 23; }
             NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
             if (adv && !adv->isAdvertising()) adv->start();   // chưa có ai kết nối / vừa bị ngắt: phải quảng bá (lại)
             vTaskDelay(pdMS_TO_TICKS(250));
@@ -83,7 +81,6 @@ void senderTask(void*) {
         }
         if (!wasConn) {
             wasConn = true;
-            s_connected = true;
             connectedSince = millis();
             portENTER_CRITICAL(&s_mux);
             s_ring.droppedLines = 0;   // chỉ báo số dòng bị bỏ kể từ lúc kết nối
@@ -140,7 +137,7 @@ bool startRunning() {
     NimBLEDevice::setMTU(247);
 
     s_server = NimBLEDevice::createServer();
-    s_server->setCallbacks(&s_serverCb);
+    s_server->setCallbacks(&s_serverCb, false);
     NimBLEService* svc = s_server->createService(kUuidService);
     s_tx = svc->createCharacteristic(kUuidTx, NIMBLE_PROPERTY::NOTIFY);
     svc->createCharacteristic(kUuidRx, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
@@ -151,7 +148,6 @@ bool startRunning() {
     adv->start();   // phát ngay: điện thoại quét thấy "FollowRobot" là kết nối được
 
     s_reqStop = false;
-    s_connected = false;
     s_mtu = 23;
     s_state = St::RUNNING;   // phải đặt trước khi tạo task để log() nhận dòng
 
@@ -186,7 +182,6 @@ void begin() {
 }
 
 bool enabled() { return s_state == St::RUNNING; }
-bool connected() { return s_connected; }
 
 void pause() { stopRunning(); }   // WiFi (VIEW) cần SRAM nội
 

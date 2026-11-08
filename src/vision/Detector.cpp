@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include "RobotConfig.h"
+#include "Letterbox.h"
 
 namespace {
-// Số class KHÔNG đặt cứng ở đây nữa: lấy từ output tensor [1, 4 + số_class, số_box].
-constexpr float CONF_THRESHOLD = Cfg::DETECT_CONF_THRESHOLD;   // chỉnh trong RobotConfig.h
-constexpr float NMS_IOU_THRESHOLD = 0.45f;
+// Số class KHÔNG đặt cứng ở đây: lấy từ output tensor [1, 4 + số_class, số_box].
+// Ngưỡng điểm / NMS chỉnh trong RobotConfig.h.
+constexpr float CONF_THRESHOLD = Cfg::DETECT_CONF_THRESHOLD;
+constexpr float NMS_IOU_THRESHOLD = Cfg::NMS_IOU_THRESHOLD;
 
 float iou(const Detection& a, const Detection& b) {
     int ax1 = a.cx - a.w / 2, ay1 = a.cy - a.h / 2;
@@ -53,6 +55,45 @@ std::vector<Detection> nonMaxSuppression(std::vector<Detection>& candidates) {
 }
 
 std::vector<float> g_classMax;  // điểm cao nhất của từng class ở frame gần nhất
+
+// Đổi box chuẩn hóa của model (cx, cy, w, h trong 0..1 theo khung input) về pixel ảnh camera gốc.
+// Trả false nếu box rỗng sau khi cắt vào ảnh.
+bool toCameraBox(const Letterbox& lb, int modelW, int modelH, int origW, int origH,
+                 float cx, float cy, float w, float h, Detection& out) {
+    // Output model đã normalize theo kích thước input: x, w chia cho modelW; y, h chia cho modelH.
+    const float cxModel = cx * modelW;
+    const float cyModel = cy * modelH;
+    const float wModel = w * modelW;
+    const float hModel = h * modelH;
+
+    // xyxy trên ảnh letterbox.
+    float x1 = cxModel - wModel * 0.5f;
+    float y1 = cyModel - hModel * 0.5f;
+    float x2 = cxModel + wModel * 0.5f;
+    float y2 = cyModel + hModel * 0.5f;
+
+    // Bỏ phần padding và đưa về ảnh camera.
+    x1 = (x1 - lb.padX) / lb.scale;
+    y1 = (y1 - lb.padY) / lb.scale;
+    x2 = (x2 - lb.padX) / lb.scale;
+    y2 = (y2 - lb.padY) / lb.scale;
+
+    // Giới hạn box trong ảnh gốc.
+    x1 = std::max(0.0f, std::min(x1, (float)origW));
+    y1 = std::max(0.0f, std::min(y1, (float)origH));
+    x2 = std::max(0.0f, std::min(x2, (float)origW));
+    y2 = std::max(0.0f, std::min(y2, (float)origH));
+
+    const float boxW = x2 - x1;
+    const float boxH = y2 - y1;
+    if (boxW <= 0.0f || boxH <= 0.0f) return false;
+
+    out.cx = (int)std::round((x1 + x2) * 0.5f);
+    out.cy = (int)std::round((y1 + y2) * 0.5f);
+    out.w = (int)std::round(boxW);
+    out.h = (int)std::round(boxH);
+    return true;
+}
 }  // namespace
 
 void Detector::decode(const ModelInference& model, int origWidth, int origHeight,
@@ -81,6 +122,10 @@ void Detector::decode(const ModelInference& model, int origWidth, int origHeight
 
     int numBoxes = model.outputDim(numDims - 1);
     int rowStride = numBoxes;
+
+    const int modelW = model.inputWidth();
+    const int modelH = model.inputHeight();
+    const Letterbox lb = Letterbox::make(origWidth, origHeight, modelW, modelH);   // giống Preprocess::frameToInput()
 
     std::vector<Detection> candidates;
     candidates.reserve(64);
@@ -112,68 +157,16 @@ void Detector::decode(const ModelInference& model, int origWidth, int origHeight
 
         // Lượt 2: DETECT_MULTI_LABEL = true thì mọi class có điểm >= CONF_THRESHOLD đều thành ứng viên (NMS vẫn theo từng class);
         // false thì chỉ class điểm cao nhất như bản gốc.
-        bool boxBad = false, boxReady = false;
+        bool boxReady = false;
         Detection base;
 
-        for (int c = 0; c < numClasses && !boxBad; c++) {
+        for (int c = 0; c < numClasses; c++) {
             if (!Cfg::DETECT_MULTI_LABEL && c != bestClass) continue;
             const float s = out[(4 + c) * rowStride + j];
             if (std::isnan(s) || s < CONF_THRESHOLD) continue;
 
             if (!boxReady) {
-                const int modelW = model.inputWidth();
-                const int modelH = model.inputHeight();
-
-                // Tính lại đúng letterbox parameters giống preprocessFrame().
-                float scaleW = (float)modelW / (float)origWidth;
-                float scaleH = (float)modelH / (float)origHeight;
-                float scale = std::min(scaleW, scaleH);
-
-                int resizeW = (int)std::round(origWidth * scale);
-                int resizeH = (int)std::round(origHeight * scale);
-
-                float padXf = (modelW - resizeW) / 2.0f;
-                float padYf = (modelH - resizeH) / 2.0f;
-
-                int padX = (int)std::round(padXf - 0.1f);
-                int padY = (int)std::round(padYf - 0.1f);
-
-                // Output model đã normalize theo kích thước input: x, w chia cho modelW; y, h chia cho modelH.
-                float cxModel = cx * modelW;
-                float cyModel = cy * modelH;
-                float wModel = w * modelW;
-                float hModel = h * modelH;
-
-                // xyxy trên ảnh letterbox.
-                float x1 = cxModel - wModel * 0.5f;
-                float y1 = cyModel - hModel * 0.5f;
-                float x2 = cxModel + wModel * 0.5f;
-                float y2 = cyModel + hModel * 0.5f;
-
-                // Bỏ phần padding và đưa về ảnh camera.
-                x1 = (x1 - padX) / scale;
-                y1 = (y1 - padY) / scale;
-                x2 = (x2 - padX) / scale;
-                y2 = (y2 - padY) / scale;
-
-                // Giới hạn box trong ảnh gốc.
-                x1 = std::max(0.0f, std::min(x1, (float)origWidth));
-                y1 = std::max(0.0f, std::min(y1, (float)origHeight));
-                x2 = std::max(0.0f, std::min(x2, (float)origWidth));
-                y2 = std::max(0.0f, std::min(y2, (float)origHeight));
-
-                float boxW = x2 - x1;
-                float boxH = y2 - y1;
-
-                if (boxW <= 0.0f || boxH <= 0.0f) {
-                    boxBad = true;
-                    continue;
-                }
-
-                base.cx = (int)std::round((x1 + x2) * 0.5f);
-                base.cy = (int)std::round((y1 + y2) * 0.5f);
-                base.w = (int)std::round(boxW);
-                base.h = (int)std::round(boxH);
+                if (!toCameraBox(lb, modelW, modelH, origWidth, origHeight, cx, cy, w, h, base)) break;
                 boxReady = true;
             }
 

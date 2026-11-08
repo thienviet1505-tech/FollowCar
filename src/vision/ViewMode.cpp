@@ -113,9 +113,19 @@ void leaveView(CameraModule&) {}
 
 }  // namespace
 
-extern bool g_triggerSelfTest;
-
 namespace ViewMode {
+
+namespace {
+bool s_selfTestRequested = false;
+}
+
+void requestSelfTest() { s_selfTestRequested = true; }
+
+bool takeSelfTestRequest() {
+    const bool r = s_selfTestRequested;
+    s_selfTestRequested = false;
+    return r;
+}
 
 bool active() { return s_active; }
 
@@ -137,7 +147,7 @@ void handleSerial(CameraModule& camera) {
                 else Serial.println("[Mode] Dang o che do DETECT roi");
                 break;
             case 't': case 'T':
-                g_triggerSelfTest = true;
+                requestSelfTest();
                 break;
             case 'p': case 'P':
                 camera.printSettings();
